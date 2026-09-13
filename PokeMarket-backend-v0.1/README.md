@@ -1,69 +1,22 @@
-# PokeMarket Backend v0.1
+# PokeMarket Backend 2.0
+Real multimodal scan pipeline: Android images -> Gemini -> TCGdex verification -> structured condition/authenticity screening.
 
-FastAPI backend foundation for the PokeMarket Android app.
+## Upgrade existing Render service
+Replace the contents of your current `PokeMarket-backend-v0.1` folder with these files (or rename this folder to that existing Render Root Directory). Keep the same Render service.
 
-## Includes
-- Health endpoint
-- TCGdex card search and lookup
-- Multipart card-image upload endpoint
-- Pluggable AI provider
-- Safe development stub provider
-- Environment configuration
-- Tests
-- Render deployment config
+Render environment variables:
+- ENVIRONMENT=production
+- AI_PROVIDER=gemini
+- GEMINI_MODEL=gemini-3.8-flash
+- GEMINI_API_KEY=<your secret key>
 
-## Architecture
-Android CameraX -> HTTPS -> PokeMarket API -> AI + TCGdex -> database/storage later
+Never put GEMINI_API_KEY in GitHub.
 
-TCGdex does not require an API key.
+Build: `pip install -r requirements.txt`
+Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 
-## Local setup
+After deploy, `/api/v1/health` reports version 2.0.0.
 
-```bash
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
+`POST /api/v1/scan/analyze` accepts repeated multipart `files` fields (JPEG/PNG/WebP), plus optional `include_condition` and `include_authenticity` booleans.
 
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-API docs: http://127.0.0.1:8000/docs
-
-## GitHub
-
-Create a repository such as `pokemarket-backend` and upload this folder.
-
-Never commit `.env` or API keys.
-
-## Render
-
-Build command:
-`pip install -r requirements.txt`
-
-Start command:
-`uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-
-`render.yaml` is included.
-
-## Endpoints
-
-- `GET /api/v1/health`
-- `GET /api/v1/cards/search?q=charizard`
-- `GET /api/v1/cards/{card_id}`
-- `POST /api/v1/scan/upload`
-- `POST /api/v1/scan/analyze`
-
-## Next phase
-
-- Supabase/Postgres
-- User accounts/authentication
-- Seller Trust
-- Persistent image storage
-- Real multimodal card identification
-- Condition analysis
-- Authenticity screening
-- Inventory and marketplace listings
-- Orders/payments/shipping
+Condition is an estimate, not an official grade. Authenticity is preliminary visual screening, not certification.

@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: pokemarket-api
+    name: pokemarket
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
@@ -8,8 +8,8 @@ services:
       - key: ENVIRONMENT
         value: production
       - key: AI_PROVIDER
-        value: stub
-      - key: AI_API_KEY
+        value: gemini
+      - key: GEMINI_API_KEY
         sync: false
-      - key: CORS_ORIGINS
-        value: "*"
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
