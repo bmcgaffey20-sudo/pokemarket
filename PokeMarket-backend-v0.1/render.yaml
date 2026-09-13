@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: pokemarket-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: AI_PROVIDER
+        value: stub
+      - key: AI_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        value: "*"
