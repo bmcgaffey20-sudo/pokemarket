@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     ai_provider: str = "stub"
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = "gemini-3.1-flash-lite"
     cors_origins: str = "*"
     # Preserve high-quality camera uploads while bounding pathological requests.
     max_image_bytes: int = 12_000_000
