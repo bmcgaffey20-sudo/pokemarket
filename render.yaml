@@ -13,3 +13,5 @@ services:
         sync: false
       - key: GEMINI_MODEL
         value: gemini-3.8-flash
+      - key: MAX_IMAGES
+        value: "9"

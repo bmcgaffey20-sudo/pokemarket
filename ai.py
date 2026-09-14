@@ -335,7 +335,9 @@ class GeminiProvider:
 
         # Keep retries deliberately low. A scan already performs two AI stages,
         # so aggressive retry loops can quickly turn one scan into many requests.
-        max_attempts_per_model = 2
+        # A scan already has two AI stages. One attempt per fallback model keeps
+        # memory and quota usage predictable on the 512 MB Render instance.
+        max_attempts_per_model = 1
 
         for model_index, model in enumerate(self.models):
             for attempt in range(max_attempts_per_model):

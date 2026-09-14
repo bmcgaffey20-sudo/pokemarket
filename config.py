@@ -8,8 +8,9 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.8-flash"
     cors_origins: str = "*"
+    # Preserve high-quality camera uploads while bounding pathological requests.
     max_image_bytes: int = 12_000_000
-    max_images: int = 10
+    max_images: int = 9
     tcgdex_base_url: str = "https://api.tcgdex.net/v2"
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 

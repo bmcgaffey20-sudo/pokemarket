@@ -1,7 +1,9 @@
+import asyncio
+import gc
 import logging
 import traceback
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from ai import get_ai_provider, new_scan_id
@@ -17,6 +19,17 @@ logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title=settings.app_name, version="2.2.0-rigorous-scan")
+scan_semaphore = asyncio.Semaphore(1)
+
+
+async def acquire_scan_slot():
+    """Keep the 512 MB Render instance from buffering multiple scans at once."""
+    await scan_semaphore.acquire()
+    try:
+        yield
+    finally:
+        scan_semaphore.release()
+        gc.collect()
 
 app.add_middleware(
     CORSMiddleware,
@@ -72,6 +85,7 @@ async def read_images(files):
 
     allowed = {"image/jpeg", "image/png", "image/webp"}
     result = []
+    labels = []
 
     for item in files:
         if item.content_type not in allowed:
@@ -89,7 +103,28 @@ async def read_images(files):
             raise HTTPException(413, "Uploaded image is too large.")
 
         label = (item.filename or "unlabelled_photo").rsplit(".", 1)[0]
+        labels.append(label)
         result.append((data, item.content_type, label))
+
+    # The Android client sends one best image per required angle, never all
+    # camera attempts. Enforce that contract server-side so duplicate frames
+    # cannot silently consume memory or dilute the analysis.
+    required = {
+        "required_front_straight",
+        "required_front_slight_left",
+        "required_front_slight_right",
+        "required_back",
+    }
+    supplied_required = [label for label in labels if label in required]
+    if set(supplied_required) != required or len(supplied_required) != 4:
+        raise HTTPException(
+            400,
+            "Exactly one best photo for each required angle is needed: "
+            "straight, slight left, slight right, and back.",
+        )
+    defect_count = sum(label.startswith("defect_") for label in labels)
+    if defect_count > 5 or len(labels) != 4 + defect_count:
+        raise HTTPException(400, "Send only the four required views and up to five defect close-ups.")
 
     return result
 
@@ -185,6 +220,7 @@ async def analyze_scan(
     files: list[UploadFile] = File(...),
     include_condition: bool = Form(True),
     include_authenticity: bool = Form(True),
+    _scan_slot=Depends(acquire_scan_slot),
 ):
     images = await read_images(files)
 
