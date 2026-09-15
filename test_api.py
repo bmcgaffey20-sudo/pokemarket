@@ -7,7 +7,7 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.3.0-r2-storage"
+    assert r.json()["version"] == "2.3.1-r2-storage"
 
 
 def test_structural_damage_caps_optimistic_grade():

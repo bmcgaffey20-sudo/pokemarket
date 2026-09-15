@@ -24,7 +24,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.3.0-r2-storage")
+app = FastAPI(title=settings.app_name, version="2.3.1-r2-storage")
 scan_semaphore = asyncio.Semaphore(1)
 
 
@@ -52,7 +52,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.3.0-r2-storage",
+        version="2.3.1-r2-storage",
         ai_provider=settings.ai_provider,
     )
 
@@ -79,7 +79,7 @@ async def get_card(card_id: str):
         raise HTTPException(502, f"TCGdex request failed: {exc}") from exc
 
 
-async def read_images(files):
+async def read_images(files, labels=None):
     if not files:
         raise HTTPException(400, "At least one image is required.")
 
@@ -93,7 +93,7 @@ async def read_images(files):
     result = []
     labels = []
 
-    for item in files:
+    for index, item in enumerate(files):
         if item.content_type not in allowed:
             raise HTTPException(
                 415,
@@ -108,7 +108,11 @@ async def read_images(files):
         if len(data) > settings.max_image_bytes:
             raise HTTPException(413, "Uploaded image is too large.")
 
-        label = (item.filename or "unlabelled_photo").rsplit(".", 1)[0]
+        label = (
+            labels[index]
+            if labels is not None
+            else (item.filename or "unlabelled_photo").rsplit(".", 1)[0]
+        )
         labels.append(label)
         result.append((data, item.content_type, label))
 
@@ -359,8 +363,8 @@ def get_r2_storage():
         raise HTTPException(503, str(exc)) from exc
 
 
-async def persist_images(listing_id, files):
-    images = await read_images(files)
+async def persist_images(listing_id, files, labels=None):
+    images = await read_images(files, labels=labels)
 
     try:
         stored = await asyncio.to_thread(
@@ -390,9 +394,19 @@ async def persist_images(listing_id, files):
 )
 async def upload_listing_images(
     listing_id: str,
-    files: list[UploadFile] = File(...),
+    front_straight: UploadFile = File(...),
+    front_slight_left: UploadFile = File(...),
+    front_slight_right: UploadFile = File(...),
+    back: UploadFile = File(...),
 ):
-    return await persist_images(listing_id, files)
+    files = [front_straight, front_slight_left, front_slight_right, back]
+    labels = [
+        "required_front_straight",
+        "required_front_slight_left",
+        "required_front_slight_right",
+        "required_back",
+    ]
+    return await persist_images(listing_id, files, labels=labels)
 
 
 @app.post("/api/v1/scan/upload", response_model=ListingImageUploadResponse)
