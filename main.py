@@ -24,7 +24,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.3.1-r2-storage")
+app = FastAPI(title=settings.app_name, version="2.3.2-r2-storage")
 scan_semaphore = asyncio.Semaphore(1)
 
 
@@ -52,7 +52,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.3.1-r2-storage",
+        version="2.3.2-r2-storage",
         ai_provider=settings.ai_provider,
     )
 
@@ -79,7 +79,7 @@ async def get_card(card_id: str):
         raise HTTPException(502, f"TCGdex request failed: {exc}") from exc
 
 
-async def read_images(files, labels=None):
+async def read_images(files, forced_labels=None):
     if not files:
         raise HTTPException(400, "At least one image is required.")
 
@@ -88,6 +88,9 @@ async def read_images(files, labels=None):
             413,
             f"Maximum image count is {settings.max_images}.",
         )
+
+    if forced_labels is not None and len(forced_labels) != len(files):
+        raise HTTPException(400, "Every uploaded image must have exactly one label.")
 
     allowed = {"image/jpeg", "image/png", "image/webp"}
     result = []
@@ -109,8 +112,8 @@ async def read_images(files, labels=None):
             raise HTTPException(413, "Uploaded image is too large.")
 
         label = (
-            labels[index]
-            if labels is not None
+            forced_labels[index]
+            if forced_labels is not None
             else (item.filename or "unlabelled_photo").rsplit(".", 1)[0]
         )
         labels.append(label)
@@ -363,8 +366,8 @@ def get_r2_storage():
         raise HTTPException(503, str(exc)) from exc
 
 
-async def persist_images(listing_id, files, labels=None):
-    images = await read_images(files, labels=labels)
+async def persist_images(listing_id, files, forced_labels=None):
+    images = await read_images(files, forced_labels=forced_labels)
 
     try:
         stored = await asyncio.to_thread(
@@ -406,7 +409,7 @@ async def upload_listing_images(
         "required_front_slight_right",
         "required_back",
     ]
-    return await persist_images(listing_id, files, labels=labels)
+    return await persist_images(listing_id, files, forced_labels=labels)
 
 
 @app.post("/api/v1/scan/upload", response_model=ListingImageUploadResponse)

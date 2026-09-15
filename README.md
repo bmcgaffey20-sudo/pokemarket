@@ -1,4 +1,4 @@
-# PokeMarket Backend 2.3.1 — Cloudflare R2 Storage
+# PokeMarket Backend 2.3.2 — Cloudflare R2 Storage
 
 Adds labelled defect close-ups, strict condition inspection, explicit major-defect
 reporting, confidence normalization, and a server-side safeguard that prevents a
@@ -38,6 +38,6 @@ R2_ACCESS_KEY_ID=<your Cloudflare access key ID>
 R2_SECRET_ACCESS_KEY=<your Cloudflare secret access key>
 
 After deployment, /api/v1/health should show:
-"version":"2.3.1-r2-storage"
+"version":"2.3.2-r2-storage"
 
 Do not upload .pyc files, __pycache__, download, or download (1).

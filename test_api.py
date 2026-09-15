@@ -1,5 +1,7 @@
+import asyncio
+
 from fastapi.testclient import TestClient
-from main import app, apply_grading_safeguards
+from main import app, apply_grading_safeguards, read_images
 from storage import R2Storage
 
 client = TestClient(app)
@@ -7,7 +9,7 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.3.1-r2-storage"
+    assert r.json()["version"] == "2.3.2-r2-storage"
 
 
 def test_structural_damage_caps_optimistic_grade():
@@ -43,6 +45,30 @@ def test_near_mint_confidence_is_capped_without_closeup():
         [(b"jpeg", "image/jpeg", "required_front_straight")],
     )
     assert condition["confidence"] == 0.75
+
+
+class FakeUpload:
+    content_type = "image/jpeg"
+
+    def __init__(self, filename):
+        self.filename = filename
+
+    async def read(self):
+        return b"jpeg"
+
+
+def test_read_images_keeps_forced_angle_labels():
+    files = [FakeUpload(f"phone_photo_{index}.jpg") for index in range(4)]
+    labels = [
+        "required_front_straight",
+        "required_front_slight_left",
+        "required_front_slight_right",
+        "required_back",
+    ]
+
+    images = asyncio.run(read_images(files, forced_labels=labels))
+
+    assert [image[2] for image in images] == labels
 
 
 class FakeR2Client:
