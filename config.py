@@ -1,0 +1,39 @@
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    app_name: str = "PokeMarket API"
+    environment: str = "development"
+    ai_provider: str = "stub"
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-3.1-flash-lite"
+    cors_origins: str = "*"
+    # Preserve high-quality camera uploads while bounding pathological requests.
+    max_image_bytes: int = 12_000_000
+    max_images: int = 9
+    tcgdex_base_url: str = "https://api.tcgdex.net/v2"
+    r2_bucket_name: str | None = None
+    r2_endpoint: str | None = None
+    r2_access_key_id: str | None = None
+    r2_secret_access_key: str | None = None
+    r2_presigned_url_expiry_seconds: int = 3600
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+
+    @property
+    def cors_origin_list(self):
+        return ["*"] if self.cors_origins.strip() == "*" else [x.strip() for x in self.cors_origins.split(",") if x.strip()]
+
+    @property
+    def r2_configured(self):
+        return all(
+            (
+                self.r2_bucket_name,
+                self.r2_endpoint,
+                self.r2_access_key_id,
+                self.r2_secret_access_key,
+            )
+        )
+
+@lru_cache
+def get_settings():
+    return Settings()
