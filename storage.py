@@ -1,5 +1,6 @@
 import re
 from pathlib import PurePosixPath
+from uuid import uuid4
 
 
 LISTING_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -54,7 +55,7 @@ class R2Storage:
         self.client = client
 
     @staticmethod
-    def _validate_listing_id(listing_id):
+    def validate_listing_id(listing_id):
         value = (listing_id or "").strip()
         if not LISTING_ID_PATTERN.fullmatch(value):
             raise ValueError(
@@ -63,19 +64,28 @@ class R2Storage:
         return value
 
     @staticmethod
-    def _object_key(listing_id, label, content_type):
+    def _object_key(listing_id, upload_id, label, content_type):
         safe_label = LABEL_PATTERN.sub("_", label).strip("_") or "photo"
         extension = CONTENT_TYPE_EXTENSIONS[content_type]
-        return str(PurePosixPath("listings", listing_id, safe_label + extension))
+        return str(
+            PurePosixPath(
+                "listings",
+                listing_id,
+                "originals",
+                upload_id,
+                safe_label + extension,
+            )
+        )
 
     def upload_images(self, listing_id, images):
-        listing_id = self._validate_listing_id(listing_id)
+        listing_id = self.validate_listing_id(listing_id)
+        upload_id = uuid4().hex
         uploaded_keys = []
         stored = []
 
         try:
             for data, content_type, label in images:
-                object_key = self._object_key(listing_id, label, content_type)
+                object_key = self._object_key(listing_id, upload_id, label, content_type)
                 self.client.put_object(
                     Bucket=self.bucket_name,
                     Key=object_key,
@@ -107,3 +117,20 @@ class R2Storage:
             raise R2UploadError(f"R2 image upload failed: {exc}") from exc
 
         return stored
+
+    def delete_objects(self, object_keys):
+        failures = []
+        for object_key in object_keys:
+            try:
+                self.client.delete_object(Bucket=self.bucket_name, Key=object_key)
+            except Exception as exc:
+                failures.append(f"{object_key}: {exc}")
+        if failures:
+            raise R2UploadError("Could not delete R2 objects: " + "; ".join(failures))
+
+    def presign_object(self, object_key):
+        return self.client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket_name, "Key": object_key},
+            ExpiresIn=self.url_expiry,
+        )

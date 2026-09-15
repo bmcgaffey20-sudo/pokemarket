@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     max_image_bytes: int = 12_000_000
     max_images: int = 9
     tcgdex_base_url: str = "https://api.tcgdex.net/v2"
+    database_url: str | None = None
     r2_bucket_name: str | None = None
     r2_endpoint: str | None = None
     r2_access_key_id: str | None = None

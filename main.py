@@ -2,16 +2,24 @@ import asyncio
 import gc
 import logging
 import traceback
+from functools import lru_cache
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from ai import get_ai_provider, new_scan_id
 from config import get_settings
+from database import (
+    Database,
+    DatabaseConfigurationError,
+    DatabaseOperationError,
+)
 from schemas import (
     CardSearchResponse,
     HealthResponse,
     ListingImageUploadResponse,
+    ListingResponse,
+    ListingUpsertRequest,
     ScanAnalysisResponse,
 )
 from storage import R2ConfigurationError, R2Storage, R2UploadError
@@ -24,7 +32,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.3.2-r2-storage")
+app = FastAPI(title=settings.app_name, version="2.4.0-postgres-listings")
 scan_semaphore = asyncio.Semaphore(1)
 
 
@@ -48,12 +56,23 @@ app.add_middleware(
 
 @app.get("/api/v1/health", response_model=HealthResponse)
 async def health():
+    if not settings.database_url:
+        database_status = "not_configured"
+    else:
+        try:
+            database = await asyncio.to_thread(get_database_client)
+            await asyncio.to_thread(database.ping)
+            database_status = "connected"
+        except Exception:
+            logger.exception("Database health check failed")
+            database_status = "unavailable"
     return HealthResponse(
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.3.2-r2-storage",
+        version="2.4.0-postgres-listings",
         ai_provider=settings.ai_provider,
+        database=database_status,
     )
 
 
@@ -366,12 +385,47 @@ def get_r2_storage():
         raise HTTPException(503, str(exc)) from exc
 
 
+@lru_cache
+def get_database_client():
+    database = Database(settings.database_url)
+    database.initialize()
+    return database
+
+
+async def require_database():
+    try:
+        return await asyncio.to_thread(get_database_client)
+    except DatabaseConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Database initialization failed")
+        raise HTTPException(503, "PostgreSQL is unavailable.") from exc
+
+
+def add_image_urls(record):
+    try:
+        storage = get_r2_storage()
+        for image in record["images"]:
+            image["url"] = storage.presign_object(image["object_key"])
+    except Exception:
+        logger.exception("Could not generate signed listing image URLs")
+        for image in record["images"]:
+            image["url"] = None
+    return record
+
+
 async def persist_images(listing_id, files, forced_labels=None):
+    try:
+        listing_id = R2Storage.validate_listing_id(listing_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    database = await require_database()
     images = await read_images(files, forced_labels=forced_labels)
+    storage = get_r2_storage()
 
     try:
         stored = await asyncio.to_thread(
-            get_r2_storage().upload_images,
+            storage.upload_images,
             listing_id,
             images,
         )
@@ -381,6 +435,29 @@ async def persist_images(listing_id, files, forced_labels=None):
         logger.exception("R2 upload failed for listing %s", listing_id)
         raise HTTPException(502, str(exc)) from exc
 
+    try:
+        _, stale_keys = await asyncio.to_thread(
+            database.replace_images,
+            listing_id,
+            stored,
+        )
+    except DatabaseOperationError as exc:
+        logger.exception("Database image-record transaction failed for %s", listing_id)
+        try:
+            await asyncio.to_thread(
+                storage.delete_objects,
+                [image["object_key"] for image in stored],
+            )
+        except R2UploadError:
+            logger.exception("Could not roll back new R2 objects for %s", listing_id)
+        raise HTTPException(502, str(exc)) from exc
+
+    if stale_keys:
+        try:
+            await asyncio.to_thread(storage.delete_objects, stale_keys)
+        except R2UploadError:
+            logger.exception("Database committed, but stale R2 cleanup failed for %s", listing_id)
+
     return ListingImageUploadResponse(
         status="stored",
         listing_id=listing_id,
@@ -389,6 +466,48 @@ async def persist_images(listing_id, files, forced_labels=None):
         persisted=True,
         images=stored,
     )
+
+
+@app.put("/api/v1/listings/{listing_id}", response_model=ListingResponse)
+async def save_listing(listing_id: str, payload: ListingUpsertRequest):
+    try:
+        listing_id = R2Storage.validate_listing_id(listing_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    database = await require_database()
+    try:
+        record = await asyncio.to_thread(
+            database.upsert_listing,
+            listing_id,
+            payload.model_dump(exclude_unset=True),
+        )
+    except DatabaseOperationError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return add_image_urls(record)
+
+
+@app.get("/api/v1/listings/{listing_id}", response_model=ListingResponse)
+async def read_listing(listing_id: str):
+    try:
+        listing_id = R2Storage.validate_listing_id(listing_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    database = await require_database()
+    record = await asyncio.to_thread(database.get_listing, listing_id)
+    if record is None:
+        raise HTTPException(404, "Listing not found.")
+    return add_image_urls(record)
+
+
+@app.get("/api/v1/listings", response_model=list[ListingResponse])
+async def read_listings(limit: int = 50, offset: int = 0):
+    if not 1 <= limit <= 100:
+        raise HTTPException(400, "limit must be between 1 and 100.")
+    if offset < 0:
+        raise HTTPException(400, "offset cannot be negative.")
+    database = await require_database()
+    records = await asyncio.to_thread(database.list_listings, limit, offset)
+    return [add_image_urls(record) for record in records]
 
 
 @app.post(

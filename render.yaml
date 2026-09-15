@@ -15,8 +15,10 @@ services:
         value: gemini-3.1-flash-lite
       - key: MAX_IMAGES
         value: "9"
+      - key: DATABASE_URL
+        sync: false
       - key: R2_BUCKET_NAME
-        value: pokemarket-images
+        value: pokemart-images
       - key: R2_ENDPOINT
         sync: false
       - key: R2_ACCESS_KEY_ID
