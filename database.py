@@ -12,9 +12,12 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     delete,
+    inspect,
     select,
     text,
+    update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 
@@ -23,6 +26,14 @@ class DatabaseConfigurationError(RuntimeError):
 
 
 class DatabaseOperationError(RuntimeError):
+    pass
+
+
+class UserAlreadyExistsError(DatabaseOperationError):
+    pass
+
+
+class ListingOwnershipError(DatabaseOperationError):
     pass
 
 
@@ -45,10 +56,31 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    email: Mapped[str] = mapped_column(String(254), unique=True, nullable=False, index=True)
+    display_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    password_salt: Mapped[str] = mapped_column(String(64), nullable=False)
+    password_iterations: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    seller_tier: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    completed_buys: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    successful_sales: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    successful_sales_over_100: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_listing_cents: Mapped[int | None] = mapped_column(Integer, default=8_000, nullable=True)
+
+
 class Listing(Base):
     __tablename__ = "listings"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    seller_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     scan_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False, index=True)
     title: Mapped[str | None] = mapped_column(String(300), nullable=True)
@@ -109,15 +141,40 @@ class Database:
 
     def initialize(self):
         Base.metadata.create_all(self.engine)
+        # create_all is intentionally non-destructive and does not add columns to
+        # the existing Neon table. Apply this one safe migration in place.
+        columns = {column["name"] for column in inspect(self.engine).get_columns("listings")}
+        if "seller_id" not in columns:
+            with self.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE listings ADD COLUMN seller_id VARCHAR(36)"))
+        with self.engine.begin() as connection:
+            connection.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_listings_seller_id ON listings (seller_id)")
+            )
 
     def ping(self):
         with self.engine.connect() as connection:
             connection.execute(text("SELECT 1"))
 
     @staticmethod
+    def _user_dict(user):
+        return {
+            "id": user.id,
+            "email": user.email,
+            "display_name": user.display_name,
+            "created_at": user.created_at,
+            "seller_tier": user.seller_tier,
+            "completed_buys": user.completed_buys,
+            "successful_sales": user.successful_sales,
+            "successful_sales_over_100": user.successful_sales_over_100,
+            "max_listing_cents": user.max_listing_cents,
+        }
+
+    @staticmethod
     def _listing_dict(listing):
         return {
             "id": listing.id,
+            "seller_id": listing.seller_id,
             "scan_id": listing.scan_id,
             "status": listing.status,
             "title": listing.title,
@@ -148,14 +205,96 @@ class Database:
             ],
         }
 
-    def replace_images(self, listing_id, stored_images):
+    def create_user(
+        self,
+        user_id,
+        email,
+        display_name,
+        password_hash,
+        password_salt,
+        password_iterations,
+        claim_legacy=False,
+    ):
+        try:
+            with self.sessions.begin() as session:
+                user = User(
+                    id=user_id,
+                    email=email,
+                    display_name=display_name,
+                    password_hash=password_hash,
+                    password_salt=password_salt,
+                    password_iterations=password_iterations,
+                )
+                session.add(user)
+                session.flush()
+                claimed = 0
+                if claim_legacy:
+                    claimed = session.execute(
+                        update(Listing)
+                        .where(Listing.seller_id.is_(None))
+                        .values(seller_id=user.id, updated_at=utc_now())
+                    ).rowcount
+                result = self._user_dict(user)
+            return result, claimed
+        except IntegrityError as exc:
+            raise UserAlreadyExistsError("An account already exists for this email.") from exc
+        except DatabaseOperationError:
+            raise
+        except Exception as exc:
+            raise DatabaseOperationError(f"Could not create account: {exc}") from exc
+
+    def get_user_by_email(self, email):
+        with self.sessions() as session:
+            user = session.execute(select(User).where(User.email == email)).scalar_one_or_none()
+            if user is None:
+                return None
+            result = self._user_dict(user)
+            result.update(
+                password_hash=user.password_hash,
+                password_salt=user.password_salt,
+                password_iterations=user.password_iterations,
+            )
+            return result
+
+    def get_user(self, user_id):
+        with self.sessions() as session:
+            user = session.get(User, user_id)
+            return self._user_dict(user) if user else None
+
+    def record_login(self, user_id):
+        with self.sessions.begin() as session:
+            session.execute(
+                update(User).where(User.id == user_id).values(last_login_at=utc_now())
+            )
+
+    def ensure_listing_owner(self, listing_id, seller_id, create=False):
         try:
             with self.sessions.begin() as session:
                 listing = session.get(Listing, listing_id)
                 if listing is None:
-                    listing = Listing(id=listing_id)
+                    if not create:
+                        return None
+                    listing = Listing(id=listing_id, seller_id=seller_id)
                     session.add(listing)
                     session.flush()
+                elif listing.seller_id != seller_id:
+                    raise ListingOwnershipError("Listing not found.")
+                return self._listing_dict(listing)
+        except ListingOwnershipError:
+            raise
+        except Exception as exc:
+            raise DatabaseOperationError(f"Could not verify listing ownership: {exc}") from exc
+
+    def replace_images(self, listing_id, stored_images, seller_id):
+        try:
+            with self.sessions.begin() as session:
+                listing = session.get(Listing, listing_id)
+                if listing is None:
+                    listing = Listing(id=listing_id, seller_id=seller_id)
+                    session.add(listing)
+                    session.flush()
+                elif listing.seller_id != seller_id:
+                    raise ListingOwnershipError("Listing not found.")
 
                 stale_keys = list(
                     session.execute(
@@ -186,36 +325,45 @@ class Database:
                 session.expire(listing, ["images"])
                 result = self._listing_dict(listing)
             return result, stale_keys
+        except ListingOwnershipError:
+            raise
         except Exception as exc:
             raise DatabaseOperationError(f"Could not save image records: {exc}") from exc
 
-    def upsert_listing(self, listing_id, values):
+    def upsert_listing(self, listing_id, values, seller_id):
         try:
             with self.sessions.begin() as session:
                 listing = session.get(Listing, listing_id)
                 if listing is None:
-                    listing = Listing(id=listing_id)
+                    listing = Listing(id=listing_id, seller_id=seller_id)
                     session.add(listing)
+                elif listing.seller_id != seller_id:
+                    raise ListingOwnershipError("Listing not found.")
                 for key, value in values.items():
                     setattr(listing, key, value)
                 listing.updated_at = utc_now()
                 session.flush()
                 session.refresh(listing)
                 return self._listing_dict(listing)
+        except ListingOwnershipError:
+            raise
         except Exception as exc:
             raise DatabaseOperationError(f"Could not save listing: {exc}") from exc
 
-    def get_listing(self, listing_id):
+    def get_listing(self, listing_id, seller_id):
         with self.sessions() as session:
             listing = session.execute(
-                select(Listing).where(Listing.id == listing_id)
+                select(Listing).where(
+                    Listing.id == listing_id,
+                    Listing.seller_id == seller_id,
+                )
             ).scalar_one_or_none()
             return self._listing_dict(listing) if listing else None
 
-    def list_listings(self, limit=50, offset=0):
+    def list_listings(self, seller_id, limit=50, offset=0):
         with self.sessions() as session:
             listings = session.execute(
-                select(Listing)
+                select(Listing).where(Listing.seller_id == seller_id)
                 .order_by(Listing.updated_at.desc())
                 .limit(limit)
                 .offset(offset)

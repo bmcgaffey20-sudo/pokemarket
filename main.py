@@ -1,26 +1,44 @@
 import asyncio
 import gc
+import hmac
 import logging
 import traceback
+import uuid
 from functools import lru_cache
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ai import get_ai_provider, new_scan_id
+from auth import (
+    AuthConfigurationError,
+    InvalidTokenError,
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    normalize_email,
+    verify_password,
+)
 from config import get_settings
 from database import (
     Database,
     DatabaseConfigurationError,
     DatabaseOperationError,
+    ListingOwnershipError,
+    UserAlreadyExistsError,
 )
 from schemas import (
+    AuthResponse,
     CardSearchResponse,
     HealthResponse,
+    LoginRequest,
     ListingImageUploadResponse,
     ListingResponse,
     ListingUpsertRequest,
+    RegisterRequest,
     ScanAnalysisResponse,
+    UserResponse,
 )
 from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
@@ -32,8 +50,9 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.4.0-postgres-listings")
+app = FastAPI(title=settings.app_name, version="2.5.0-user-accounts")
 scan_semaphore = asyncio.Semaphore(1)
+auth_scheme = HTTPBearer(auto_error=False)
 
 
 async def acquire_scan_slot():
@@ -54,6 +73,58 @@ app.add_middleware(
 )
 
 
+@lru_cache
+def get_database_client():
+    database = Database(settings.database_url)
+    database.initialize()
+    return database
+
+
+async def require_database():
+    try:
+        return await asyncio.to_thread(get_database_client)
+    except DatabaseConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Database initialization failed")
+        raise HTTPException(503, "PostgreSQL is unavailable.") from exc
+
+
+async def require_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(auth_scheme),
+    database=Depends(require_database),
+):
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(401, "Sign in is required.", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        payload = decode_access_token(credentials.credentials, settings.auth_secret)
+    except AuthConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except InvalidTokenError as exc:
+        raise HTTPException(401, str(exc), headers={"WWW-Authenticate": "Bearer"}) from exc
+    user = await asyncio.to_thread(database.get_user, payload["sub"])
+    if user is None:
+        raise HTTPException(401, "Account no longer exists.", headers={"WWW-Authenticate": "Bearer"})
+    return user
+
+
+def auth_response(user, legacy_listings_claimed=0):
+    try:
+        token = create_access_token(
+            user["id"],
+            settings.auth_secret,
+            settings.access_token_ttl_seconds,
+        )
+    except AuthConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    return AuthResponse(
+        access_token=token,
+        expires_in=settings.access_token_ttl_seconds,
+        user=UserResponse(**user),
+        legacy_listings_claimed=legacy_listings_claimed,
+    )
+
+
 @app.get("/api/v1/health", response_model=HealthResponse)
 async def health():
     if not settings.database_url:
@@ -70,10 +141,86 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.4.0-postgres-listings",
+        version="2.5.0-user-accounts",
         ai_provider=settings.ai_provider,
         database=database_status,
+        auth="configured" if settings.auth_configured else "not_configured",
     )
+
+
+@app.post("/api/v1/auth/register", response_model=AuthResponse, status_code=201)
+async def register(payload: RegisterRequest, database=Depends(require_database)):
+    if not settings.auth_configured:
+        raise HTTPException(503, "AUTH_SECRET must be configured before accounts can be created.")
+    claim_legacy = bool(payload.legacy_claim_code)
+    if claim_legacy and (
+        not settings.legacy_claim_code
+        or not hmac.compare_digest(
+            payload.legacy_claim_code.encode("utf-8"),
+            settings.legacy_claim_code.encode("utf-8"),
+        )
+    ):
+        raise HTTPException(403, "The existing-listing setup code is incorrect.")
+    password_salt, password_hash, iterations = await asyncio.to_thread(
+        hash_password,
+        payload.password,
+        settings.password_hash_iterations,
+    )
+    try:
+        user, claimed = await asyncio.to_thread(
+            database.create_user,
+            str(uuid.uuid4()),
+            normalize_email(payload.email),
+            payload.display_name,
+            password_hash,
+            password_salt,
+            iterations,
+            claim_legacy,
+        )
+    except UserAlreadyExistsError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except DatabaseOperationError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return auth_response(user, legacy_listings_claimed=claimed)
+
+
+@app.post("/api/v1/auth/login", response_model=AuthResponse)
+async def login(payload: LoginRequest, database=Depends(require_database)):
+    if not settings.auth_configured:
+        raise HTTPException(503, "AUTH_SECRET must be configured before sign-in is available.")
+    user = await asyncio.to_thread(database.get_user_by_email, normalize_email(payload.email))
+    valid = False
+    if user is not None:
+        valid = await asyncio.to_thread(
+            verify_password,
+            payload.password,
+            user["password_salt"],
+            user["password_hash"],
+            user["password_iterations"],
+        )
+    if not valid:
+        raise HTTPException(401, "Email or password is incorrect.")
+    await asyncio.to_thread(database.record_login, user["id"])
+    public_user = {
+        key: user[key]
+        for key in (
+            "id",
+            "email",
+            "display_name",
+            "created_at",
+            "seller_tier",
+            "completed_buys",
+            "successful_sales",
+            "successful_sales_over_100",
+            "max_listing_cents",
+        )
+    }
+    return auth_response(public_user)
+
+
+@app.get("/api/v1/auth/me", response_model=UserResponse)
+async def read_current_user(current_user=Depends(require_user)):
+    return UserResponse(**current_user)
 
 
 @app.get("/api/v1/cards/search", response_model=CardSearchResponse)
@@ -253,6 +400,7 @@ async def analyze_scan(
     include_condition: bool = Form(True),
     include_authenticity: bool = Form(True),
     _scan_slot=Depends(acquire_scan_slot),
+    _current_user=Depends(require_user),
 ):
     images = await read_images(files)
 
@@ -385,23 +533,6 @@ def get_r2_storage():
         raise HTTPException(503, str(exc)) from exc
 
 
-@lru_cache
-def get_database_client():
-    database = Database(settings.database_url)
-    database.initialize()
-    return database
-
-
-async def require_database():
-    try:
-        return await asyncio.to_thread(get_database_client)
-    except DatabaseConfigurationError as exc:
-        raise HTTPException(503, str(exc)) from exc
-    except Exception as exc:
-        logger.exception("Database initialization failed")
-        raise HTTPException(503, "PostgreSQL is unavailable.") from exc
-
-
 def add_image_urls(record):
     try:
         storage = get_r2_storage()
@@ -414,13 +545,18 @@ def add_image_urls(record):
     return record
 
 
-async def persist_images(listing_id, files, forced_labels=None):
+async def persist_images(listing_id, files, seller_id, database, forced_labels=None):
     try:
         listing_id = R2Storage.validate_listing_id(listing_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    database = await require_database()
     images = await read_images(files, forced_labels=forced_labels)
+    try:
+        await asyncio.to_thread(database.ensure_listing_owner, listing_id, seller_id, True)
+    except ListingOwnershipError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except DatabaseOperationError as exc:
+        raise HTTPException(502, str(exc)) from exc
     storage = get_r2_storage()
 
     try:
@@ -440,7 +576,18 @@ async def persist_images(listing_id, files, forced_labels=None):
             database.replace_images,
             listing_id,
             stored,
+            seller_id,
         )
+    except ListingOwnershipError as exc:
+        logger.warning("Image ownership check failed for listing %s", listing_id)
+        try:
+            await asyncio.to_thread(
+                storage.delete_objects,
+                [image["object_key"] for image in stored],
+            )
+        except R2UploadError:
+            logger.exception("Could not roll back unauthorized R2 upload for %s", listing_id)
+        raise HTTPException(404, str(exc)) from exc
     except DatabaseOperationError as exc:
         logger.exception("Database image-record transaction failed for %s", listing_id)
         try:
@@ -469,44 +616,73 @@ async def persist_images(listing_id, files, forced_labels=None):
 
 
 @app.put("/api/v1/listings/{listing_id}", response_model=ListingResponse)
-async def save_listing(listing_id: str, payload: ListingUpsertRequest):
+async def save_listing(
+    listing_id: str,
+    payload: ListingUpsertRequest,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
     try:
         listing_id = R2Storage.validate_listing_id(listing_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    database = await require_database()
+    if (
+        payload.price_cents is not None
+        and current_user["max_listing_cents"] is not None
+        and payload.price_cents > current_user["max_listing_cents"]
+    ):
+        limit = current_user["max_listing_cents"] / 100
+        raise HTTPException(
+            403,
+            f"Seller Tier {current_user['seller_tier']} has a ${limit:.2f} listing limit.",
+        )
     try:
         record = await asyncio.to_thread(
             database.upsert_listing,
             listing_id,
             payload.model_dump(exclude_unset=True),
+            current_user["id"],
         )
+    except ListingOwnershipError as exc:
+        raise HTTPException(404, str(exc)) from exc
     except DatabaseOperationError as exc:
         raise HTTPException(502, str(exc)) from exc
     return add_image_urls(record)
 
 
 @app.get("/api/v1/listings/{listing_id}", response_model=ListingResponse)
-async def read_listing(listing_id: str):
+async def read_listing(
+    listing_id: str,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
     try:
         listing_id = R2Storage.validate_listing_id(listing_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    database = await require_database()
-    record = await asyncio.to_thread(database.get_listing, listing_id)
+    record = await asyncio.to_thread(database.get_listing, listing_id, current_user["id"])
     if record is None:
         raise HTTPException(404, "Listing not found.")
     return add_image_urls(record)
 
 
 @app.get("/api/v1/listings", response_model=list[ListingResponse])
-async def read_listings(limit: int = 50, offset: int = 0):
+async def read_listings(
+    limit: int = 50,
+    offset: int = 0,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
     if not 1 <= limit <= 100:
         raise HTTPException(400, "limit must be between 1 and 100.")
     if offset < 0:
         raise HTTPException(400, "offset cannot be negative.")
-    database = await require_database()
-    records = await asyncio.to_thread(database.list_listings, limit, offset)
+    records = await asyncio.to_thread(
+        database.list_listings,
+        current_user["id"],
+        limit,
+        offset,
+    )
     return [add_image_urls(record) for record in records]
 
 
@@ -520,6 +696,8 @@ async def upload_listing_images(
     front_slight_left: UploadFile = File(...),
     front_slight_right: UploadFile = File(...),
     back: UploadFile = File(...),
+    current_user=Depends(require_user),
+    database=Depends(require_database),
 ):
     files = [front_straight, front_slight_left, front_slight_right, back]
     labels = [
@@ -528,13 +706,21 @@ async def upload_listing_images(
         "required_front_slight_right",
         "required_back",
     ]
-    return await persist_images(listing_id, files, forced_labels=labels)
+    return await persist_images(
+        listing_id,
+        files,
+        current_user["id"],
+        database,
+        forced_labels=labels,
+    )
 
 
 @app.post("/api/v1/scan/upload", response_model=ListingImageUploadResponse)
 async def upload_only(
     files: list[UploadFile] = File(...),
     listing_id: str = Form(...),
+    current_user=Depends(require_user),
+    database=Depends(require_database),
 ):
     """Compatibility route for the Android scan client."""
-    return await persist_images(listing_id, files)
+    return await persist_images(listing_id, files, current_user["id"], database)

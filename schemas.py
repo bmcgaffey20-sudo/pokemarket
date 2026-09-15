@@ -1,6 +1,8 @@
 from datetime import datetime
 from typing import Any, Literal
 
+import re
+
 from pydantic import BaseModel, Field, field_validator
 
 class HealthResponse(BaseModel):
@@ -10,6 +12,56 @@ class HealthResponse(BaseModel):
     version: str
     ai_provider: str
     database: str
+    auth: str
+
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=254)
+    display_name: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=10, max_length=128)
+    legacy_claim_code: str | None = Field(default=None, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value):
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", normalized):
+            raise ValueError("Enter a valid email address.")
+        return normalized
+
+    @field_validator("display_name")
+    @classmethod
+    def normalize_display_name(cls, value):
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Display name cannot be blank.")
+        return normalized
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=1, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_login_email(cls, value):
+        return value.strip().lower()
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    display_name: str
+    created_at: datetime
+    seller_tier: int
+    completed_buys: int
+    successful_sales: int
+    successful_sales_over_100: int
+    max_listing_cents: int | None
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int
+    user: UserResponse
+    legacy_listings_claimed: int = 0
 
 class CardSearchResponse(BaseModel):
     query: str
@@ -78,6 +130,7 @@ class ListingImageRecord(BaseModel):
 
 class ListingResponse(BaseModel):
     id: str
+    seller_id: str
     scan_id: str | None = None
     status: str
     title: str | None = None

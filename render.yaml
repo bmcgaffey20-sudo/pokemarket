@@ -17,6 +17,10 @@ services:
         value: "9"
       - key: DATABASE_URL
         sync: false
+      - key: AUTH_SECRET
+        sync: false
+      - key: LEGACY_CLAIM_CODE
+        sync: false
       - key: R2_BUCKET_NAME
         value: pokemart-images
       - key: R2_ENDPOINT

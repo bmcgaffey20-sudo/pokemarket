@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     max_images: int = 9
     tcgdex_base_url: str = "https://api.tcgdex.net/v2"
     database_url: str | None = None
+    auth_secret: str | None = None
+    legacy_claim_code: str | None = None
+    access_token_ttl_seconds: int = 2_592_000
+    password_hash_iterations: int = 600_000
     r2_bucket_name: str | None = None
     r2_endpoint: str | None = None
     r2_access_key_id: str | None = None
@@ -34,6 +38,10 @@ class Settings(BaseSettings):
                 self.r2_secret_access_key,
             )
         )
+
+    @property
+    def auth_configured(self):
+        return bool(self.auth_secret and len(self.auth_secret.strip()) >= 32)
 
 @lru_cache
 def get_settings():
