@@ -26,6 +26,7 @@ from database import (
     DatabaseConfigurationError,
     DatabaseOperationError,
     ListingOwnershipError,
+    ListingValidationError,
     UserAlreadyExistsError,
 )
 from schemas import (
@@ -50,7 +51,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.5.0-user-accounts")
+app = FastAPI(title=settings.app_name, version="2.6.0-publish-listings")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -141,7 +142,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.5.0-user-accounts",
+        version="2.6.0-publish-listings",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -645,9 +646,53 @@ async def save_listing(
         )
     except ListingOwnershipError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except ListingValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
     except DatabaseOperationError as exc:
         raise HTTPException(502, str(exc)) from exc
     return add_image_urls(record)
+
+
+@app.post("/api/v1/listings/{listing_id}/publish", response_model=ListingResponse)
+async def publish_listing(listing_id: str, current_user=Depends(require_user), database=Depends(require_database)):
+    return await publication_action(database, listing_id, current_user["id"], True)
+
+
+@app.post("/api/v1/listings/{listing_id}/unpublish", response_model=ListingResponse)
+async def unpublish_listing(listing_id: str, current_user=Depends(require_user), database=Depends(require_database)):
+    return await publication_action(database, listing_id, current_user["id"], False)
+
+
+async def publication_action(database, listing_id, seller_id, publish):
+    try:
+        record = await asyncio.to_thread(database.set_publication, listing_id, seller_id, publish)
+    except ListingOwnershipError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ListingValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return add_image_urls(record)
+
+
+def public_image_urls(record):
+    add_image_urls(record)
+    record["images"] = [{"label": image["label"], "url": image["url"]} for image in record["images"]]
+    return record
+
+
+@app.get("/api/v1/marketplace")
+async def browse_marketplace(limit: int = 20, offset: int = 0, q: str = "", database=Depends(require_database)):
+    if not 1 <= limit <= 50 or offset < 0 or len(q) > 200:
+        raise HTTPException(400, "Invalid pagination or search query.")
+    records = await asyncio.to_thread(database.marketplace, limit, offset, q)
+    return [public_image_urls(record) for record in records]
+
+
+@app.get("/api/v1/marketplace/{listing_id}")
+async def marketplace_detail(listing_id: str, database=Depends(require_database)):
+    records = await asyncio.to_thread(database.marketplace, listing_id=listing_id)
+    if not records:
+        raise HTTPException(404, "This listing is no longer available.")
+    return public_image_urls(records[0])
 
 
 @app.get("/api/v1/listings/{listing_id}", response_model=ListingResponse)

@@ -2,6 +2,7 @@ import asyncio
 import re
 import sqlite3
 import uuid
+import pytest
 
 from fastapi.testclient import TestClient
 from auth import create_access_token, decode_access_token, hash_password, verify_password
@@ -14,7 +15,7 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.5.0-user-accounts"
+    assert r.json()["version"] == "2.6.0-publish-listings"
     assert r.json()["database"] in {"not_configured", "connected"}
     assert r.json()["auth"] in {"not_configured", "configured"}
 
@@ -130,7 +131,7 @@ def test_render_postgres_url_uses_psycopg_driver():
 def test_initialize_adds_seller_id_to_existing_listing_table(tmp_path):
     path = tmp_path / "legacy-schema.db"
     connection = sqlite3.connect(path)
-    connection.execute("CREATE TABLE listings (id VARCHAR(64) PRIMARY KEY)")
+    connection.execute("CREATE TABLE listings (id VARCHAR(64) PRIMARY KEY, status VARCHAR(32) DEFAULT 'draft')")
     connection.commit()
     connection.close()
     database = Database(f"sqlite:///{path}")

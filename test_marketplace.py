@@ -1,0 +1,97 @@
+import pytest
+from fastapi.testclient import TestClient
+from database import Database, Listing
+from main import app, require_database, require_user
+
+
+@pytest.fixture
+def market(tmp_path, monkeypatch):
+    database = Database(f"sqlite:///{tmp_path / 'market.db'}")
+    database.initialize()
+    user, _ = database.create_user("seller", "seller@example.com", "Seller", "hash", "salt", 10000)
+    database.create_user("other", "other@example.com", "Other", "hash", "salt", 10000)
+    app.dependency_overrides[require_database] = lambda: database
+    app.dependency_overrides[require_user] = lambda: user
+    class Storage:
+        def presign_object(self, key):
+            return "https://example.com/signed-photo"
+    monkeypatch.setattr("main.get_r2_storage", lambda: Storage())
+    database.upsert_listing("card", dict(title="Dracozolt VMAX", description="Condition disclosure", price_cents=1250, currency="USD", card_name="Dracozolt", estimated_condition="Near Mint", status="draft"), "seller")
+    images = [dict(label="required_" + label, object_key="listings/card/" + label, content_type="image/jpeg", size_bytes=100) for label in ("front_straight", "front_slight_left", "front_slight_right", "back")]
+    database.replace_images("card", images, "seller")
+    try:
+        yield TestClient(app), database, user, images
+    finally:
+        app.dependency_overrides.clear()
+        database.engine.dispose()
+
+
+def test_publish_browse_withdraw_and_privacy(market):
+    client, db, _, _ = market
+    assert client.get("/api/v1/marketplace").json() == []
+    assert client.get("/api/v1/marketplace/card").status_code == 404
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    public = client.get("/api/v1/marketplace/card").json()
+    assert public["title"] == "Dracozolt VMAX"
+    assert public["seller"] == {"display_name": "Seller", "tier": 1}
+    assert not {"seller_id", "scan_id", "ai_result", "email", "password_hash"} & public.keys()
+    assert set(public["images"][0]) == {"label", "url"}
+    assert len(client.get("/api/v1/marketplace?q=dracozolt").json()) == 1
+    assert client.get("/api/v1/marketplace?q=missing").json() == []
+    assert client.get("/api/v1/marketplace?offset=1").json() == []
+    assert client.get("/api/v1/marketplace?limit=1000").status_code == 400
+    assert client.post("/api/v1/listings/card/unpublish").status_code == 200
+    assert client.get("/api/v1/marketplace/card").status_code == 404
+    assert len(db.get_listing("card", "seller")["images"]) == 4
+
+
+@pytest.mark.parametrize("field,value", [("title", "  "), ("description", ""), ("card_name", None), ("estimated_condition", ""), ("price_cents", 0), ("price_cents", 8001), ("currency", "EUR")])
+def test_incomplete_or_over_limit_publish_rejected(market, field, value):
+    client, db, _, _ = market
+    db.upsert_listing("card", {field: value}, "seller")
+    assert client.post("/api/v1/listings/card/publish").status_code == 422
+    assert client.get("/api/v1/marketplace").json() == []
+
+
+def test_photos_ownership_and_status_bypass(market):
+    client, db, _, images = market
+    assert client.put("/api/v1/listings/card", json={"status": "published"}).status_code == 422
+    app.dependency_overrides[require_user] = lambda: db.get_user("other")
+    assert client.post("/api/v1/listings/card/publish").status_code == 404
+    assert client.post("/api/v1/listings/card/unpublish").status_code == 404
+    app.dependency_overrides[require_user] = lambda: db.get_user("seller")
+    db.replace_images("card", images[:3], "seller")
+    assert client.post("/api/v1/listings/card/publish").status_code == 422
+    db.replace_images("card", images, "seller")
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    assert client.put("/api/v1/listings/card", json={"description": " "}).status_code == 422
+    assert db.get_listing("card", "seller")["description"] == "Condition disclosure"
+    db.replace_images("card", images[:3], "seller")
+    assert client.get("/api/v1/marketplace").json() == []
+    app.dependency_overrides.pop(require_user)
+    assert client.post("/api/v1/listings/card/publish").status_code == 401
+
+
+def test_manual_legacy_published_flag_is_not_public(market):
+    client, db, _, _ = market
+    with db.sessions.begin() as session:
+        listing = session.get(Listing, "card")
+        listing.status = "published"
+        listing.publication_approved = False
+    assert client.get("/api/v1/marketplace").json() == []
+
+
+def test_migration_preserves_drafts_and_requires_explicit_publish(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'migration.db'}")
+    db.initialize()
+    with db.engine.begin() as connection:
+        connection.exec_driver_sql("ALTER TABLE listings DROP COLUMN publication_approved")
+        connection.exec_driver_sql("INSERT INTO listings (id, status, currency, photos_persisted, created_at, updated_at) VALUES ('old', 'published', 'USD', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)")
+    db.initialize()
+    db.initialize()
+    with db.sessions() as session:
+        listing = session.get(Listing, "old")
+        assert listing.status == "draft"
+        assert not listing.publication_approved
+    db.engine.dispose()

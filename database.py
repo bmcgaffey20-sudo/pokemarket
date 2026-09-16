@@ -37,6 +37,23 @@ class ListingOwnershipError(DatabaseOperationError):
     pass
 
 
+class ListingValidationError(DatabaseOperationError):
+    pass
+
+
+def validate_publication(listing, seller):
+    for field in ("title", "description", "card_name", "estimated_condition"):
+        if not (getattr(listing, field) or "").strip():
+            raise ListingValidationError(f"Add {field.replace('_', ' ')} before publishing.")
+    if listing.currency != "USD" or not listing.price_cents or listing.price_cents < 1:
+        raise ListingValidationError("Set a positive USD price before publishing.")
+    if seller.max_listing_cents is not None and listing.price_cents > seller.max_listing_cents:
+        raise ListingValidationError("Price exceeds your seller tier limit.")
+    required = {"required_front_straight", "required_front_slight_left", "required_front_slight_right", "required_back"}
+    if not listing.photos_persisted or not required.issubset({i.label for i in listing.images if i.size_bytes > 0 and i.object_key}):
+        raise ListingValidationError("Upload all four required card photos before publishing.")
+
+
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -83,6 +100,7 @@ class Listing(Base):
     )
     scan_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False, index=True)
+    publication_approved: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     title: Mapped[str | None] = mapped_column(String(300), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     price_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -147,6 +165,10 @@ class Database:
         if "seller_id" not in columns:
             with self.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE listings ADD COLUMN seller_id VARCHAR(36)"))
+        if "publication_approved" not in columns:
+            with self.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE listings ADD COLUMN publication_approved BOOLEAN NOT NULL DEFAULT false"))
+                connection.execute(text("UPDATE listings SET status = 'draft' WHERE status = 'published'"))
         with self.engine.begin() as connection:
             connection.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_listings_seller_id ON listings (seller_id)")
@@ -288,7 +310,7 @@ class Database:
     def replace_images(self, listing_id, stored_images, seller_id):
         try:
             with self.sessions.begin() as session:
-                listing = session.get(Listing, listing_id)
+                listing = session.get(Listing, listing_id, with_for_update=True)
                 if listing is None:
                     listing = Listing(id=listing_id, seller_id=seller_id)
                     session.add(listing)
@@ -320,6 +342,10 @@ class Database:
                     )
 
                 listing.photos_persisted = True
+                listing.publication_approved = False
+                # Replacing photos requires a fresh publication review.
+                if listing.status == "published":
+                    listing.status = "draft"
                 listing.updated_at = utc_now()
                 session.flush()
                 session.expire(listing, ["images"])
@@ -333,19 +359,25 @@ class Database:
     def upsert_listing(self, listing_id, values, seller_id):
         try:
             with self.sessions.begin() as session:
-                listing = session.get(Listing, listing_id)
+                listing = session.get(Listing, listing_id, with_for_update=True)
                 if listing is None:
                     listing = Listing(id=listing_id, seller_id=seller_id)
                     session.add(listing)
                 elif listing.seller_id != seller_id:
                     raise ListingOwnershipError("Listing not found.")
+                if values.get("status") == "published" and listing.status != "published":
+                    raise ListingValidationError("Use Publish Listing to make this draft public.")
                 for key, value in values.items():
                     setattr(listing, key, value)
+                if listing.status == "published":
+                    validate_publication(listing, session.get(User, seller_id))
+                else:
+                    listing.publication_approved = False
                 listing.updated_at = utc_now()
                 session.flush()
                 session.refresh(listing)
                 return self._listing_dict(listing)
-        except ListingOwnershipError:
+        except (ListingOwnershipError, ListingValidationError):
             raise
         except Exception as exc:
             raise DatabaseOperationError(f"Could not save listing: {exc}") from exc
@@ -359,6 +391,38 @@ class Database:
                 )
             ).scalar_one_or_none()
             return self._listing_dict(listing) if listing else None
+
+    def set_publication(self, listing_id, seller_id, publish):
+        with self.sessions.begin() as session:
+            listing = session.get(Listing, listing_id, with_for_update=True)
+            if listing is None or listing.seller_id != seller_id:
+                raise ListingOwnershipError("Listing not found.")
+            if listing.status not in {"draft", "published"}:
+                raise ListingValidationError("Only a draft or published listing can use this action.")
+            if publish:
+                validate_publication(listing, session.get(User, seller_id))
+            listing.status = "published" if publish else "draft"
+            listing.publication_approved = publish
+            listing.updated_at = utc_now()
+            session.flush()
+            return self._listing_dict(listing)
+
+    def marketplace(self, limit=20, offset=0, query="", listing_id=None):
+        with self.sessions() as session:
+            statement = select(Listing, User).join(User, Listing.seller_id == User.id).where(Listing.status == "published", Listing.publication_approved.is_(True))
+            if listing_id is not None:
+                statement = statement.where(Listing.id == listing_id)
+            if query.strip():
+                statement = statement.where(Listing.title.icontains(query.strip(), autoescape=True))
+            rows = session.execute(statement.order_by(Listing.updated_at.desc(), Listing.id).limit(limit).offset(offset)).all()
+            results = []
+            for listing, seller in rows:
+                record = self._listing_dict(listing)
+                # Explicit public allowlist: no email, scan payload, local notes or credentials.
+                public = {key: record[key] for key in ("id", "title", "description", "price_cents", "currency", "card_name", "set_name", "card_number", "estimated_condition", "updated_at", "images")}
+                public["seller"] = {"display_name": seller.display_name, "tier": seller.seller_tier}
+                results.append(public)
+            return results
 
     def list_listings(self, seller_id, limit=50, offset=0):
         with self.sessions() as session:

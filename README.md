@@ -1,4 +1,6 @@
-# PokeMarket Backend 2.5.0 — User Accounts + Seller-Owned Listings
+# PokeMarket Backend 2.6.0 — Publish Listings
+
+Read UPDATE-2.6.0.md first for deployment, migration, public-photo behavior and tests.
 
 Adds labelled defect close-ups, strict condition inspection, explicit major-defect
 reporting, confidence normalization, and a server-side safeguard that prevents a
