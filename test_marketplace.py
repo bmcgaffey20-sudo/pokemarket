@@ -1,4 +1,5 @@
 import pytest
+import main
 from fastapi.testclient import TestClient
 from database import Database, Listing
 from main import app, require_database, require_user
@@ -103,6 +104,46 @@ def test_abandoned_checkout_does_not_reserve_and_first_payment_wins(market):
     assert refunded["status"] == "refunded"
     assert refunded["stripe_refund_id"] == "re_second"
     assert client.get("/api/v1/marketplace/card").status_code == 404
+
+
+def test_stripe_webhook_accepts_raw_json_body(market, monkeypatch):
+    client, db, _, _ = market
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    order = db.create_pending_order("order-webhook", "card", "other", 4)
+    db.attach_checkout_session(order["id"], "cs_raw_json")
+
+    class FakeWebhook:
+        @staticmethod
+        def construct_event(payload, signature, secret):
+            assert isinstance(payload, bytes)
+            assert b'"type":"checkout.session.completed"' in payload
+            assert signature == "test-signature"
+            assert secret == "whsec_test"
+            return {
+                "type": "checkout.session.completed",
+                "data": {
+                    "object": {
+                        "id": "cs_raw_json",
+                        "payment_status": "paid",
+                        "payment_intent": "pi_raw_json",
+                    }
+                },
+            }
+
+    class FakeStripe:
+        Webhook = FakeWebhook
+
+    monkeypatch.setattr(main.settings, "stripe_webhook_secret", "whsec_test")
+    monkeypatch.setattr(main, "require_stripe", lambda: FakeStripe())
+    response = client.post(
+        "/api/v1/payments/webhook",
+        json={"type": "checkout.session.completed"},
+        headers={"Stripe-Signature": "test-signature"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"received": True}
+    assert db.get_order("order-webhook", "other")["status"] == "paid"
 
 
 def test_migration_preserves_drafts_and_requires_explicit_publish(tmp_path):

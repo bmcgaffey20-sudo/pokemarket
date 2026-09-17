@@ -7,7 +7,7 @@ import uuid
 from functools import lru_cache
 from urllib.parse import urlparse
 
-from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,7 +65,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.8.2-payment-wins")
+app = FastAPI(title=settings.app_name, version="2.8.3-checkout-return")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -211,7 +211,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.8.2-payment-wins",
+        version="2.8.3-checkout-return",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -947,6 +947,57 @@ async def connect_refresh():
     )
 
 
+def checkout_return_page(title: str, message: str, action: str) -> HTMLResponse:
+    app_url = f"pokemarket://account?checkout={action}"
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Cache-Control" content="no-store">
+  <title>{title}</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; margin: 0; background: #faf5ff; color: #18181b; }}
+    main {{ max-width: 34rem; margin: 12vh auto; padding: 2rem; text-align: center; }}
+    a {{ display: block; padding: 1rem; border-radius: 999px; background: #4f46e5; color: white;
+         text-decoration: none; font-weight: 700; font-size: 1.1rem; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{title}</h1>
+    <p>{message}</p>
+    <a href="{app_url}">Return to PokeMarket</a>
+  </main>
+  <script>window.location.replace({app_url!r});</script>
+</body>
+</html>"""
+    return HTMLResponse(
+        html,
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+@app.get("/checkout/success", response_class=HTMLResponse)
+async def checkout_success(session_id: str | None = None):
+    # The signed Stripe webhook, not this browser redirect, is authoritative.
+    # session_id is accepted only because Stripe includes it in the return URL.
+    return checkout_return_page(
+        "Payment submitted",
+        "Your payment was submitted securely. Return to PokeMarket to view the order status.",
+        "success",
+    )
+
+
+@app.get("/checkout/cancelled", response_class=HTMLResponse)
+async def checkout_cancelled():
+    return checkout_return_page(
+        "Checkout cancelled",
+        "No purchase was completed. The card remains available unless another buyer completes payment.",
+        "cancelled",
+    )
+
+
 @app.post("/api/v1/payments/checkout", response_model=CheckoutResponse)
 async def create_checkout_session(
     payload: CheckoutRequest,
@@ -1025,7 +1076,7 @@ async def create_checkout_session(
 
 @app.post("/api/v1/payments/webhook")
 async def stripe_webhook(
-    payload: bytes = Body(...),
+    request: Request,
     stripe_signature: str | None = Header(default=None, alias="Stripe-Signature"),
     database=Depends(require_database),
 ):
@@ -1034,6 +1085,9 @@ async def stripe_webhook(
         raise HTTPException(503, "STRIPE_WEBHOOK_SECRET is not configured yet.")
     if not stripe_signature:
         raise HTTPException(400, "Stripe-Signature header is required.")
+    # Stripe signs the exact bytes it sends. Reading Request.body() avoids
+    # FastAPI/Pydantic attempting to parse the JSON before signature checking.
+    payload = await request.body()
     try:
         event = stripe_client.Webhook.construct_event(payload, stripe_signature, settings.stripe_webhook_secret)
     except Exception as exc:

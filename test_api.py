@@ -15,7 +15,7 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.8.2-payment-wins"
+    assert r.json()["version"] == "2.8.3-checkout-return"
     assert r.json()["database"] in {"not_configured", "connected"}
     assert r.json()["auth"] in {"not_configured", "configured"}
 
@@ -29,6 +29,17 @@ def test_connect_return_pages_reopen_android_app():
     expired = client.get("/api/v1/payments/connect/refresh")
     assert expired.status_code == 200
     assert "pokemarket://account?stripe=refresh" in expired.text
+
+
+def test_checkout_return_pages_reopen_android_app():
+    completed = client.get("/checkout/success?session_id=cs_test_example")
+    assert completed.status_code == 200
+    assert "pokemarket://account?checkout=success" in completed.text
+    assert completed.headers["cache-control"] == "no-store"
+
+    cancelled = client.get("/checkout/cancelled")
+    assert cancelled.status_code == 200
+    assert "pokemarket://account?checkout=cancelled" in cancelled.text
 
 
 def test_structural_damage_caps_optimistic_grade():
