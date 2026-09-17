@@ -82,6 +82,29 @@ def test_manual_legacy_published_flag_is_not_public(market):
     assert client.get("/api/v1/marketplace").json() == []
 
 
+def test_abandoned_checkout_does_not_reserve_and_first_payment_wins(market):
+    client, db, _, _ = market
+    db.create_user("third", "third@example.com", "Third", "hash", "salt", 10000)
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+
+    first = db.create_pending_order("order-1", "card", "other", 4)
+    second = db.create_pending_order("order-2", "card", "third", 4)
+    db.attach_checkout_session(first["id"], "cs_first")
+    db.attach_checkout_session(second["id"], "cs_second")
+
+    winner = db.claim_order_payment("cs_first", "pi_first")
+    assert winner["won"] is True
+    assert winner["order"]["status"] == "paid"
+
+    loser = db.claim_order_payment("cs_second", "pi_second")
+    assert loser["won"] is False
+    assert loser["order"]["status"] == "refund_pending"
+    refunded = db.mark_order_refunded("order-2", "re_second")
+    assert refunded["status"] == "refunded"
+    assert refunded["stripe_refund_id"] == "re_second"
+    assert client.get("/api/v1/marketplace/card").status_code == 404
+
+
 def test_migration_preserves_drafts_and_requires_explicit_publish(tmp_path):
     db = Database(f"sqlite:///{tmp_path / 'migration.db'}")
     db.initialize()

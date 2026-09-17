@@ -65,7 +65,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.8.1-connect-sync")
+app = FastAPI(title=settings.app_name, version="2.8.2-payment-wins")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -211,7 +211,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.8.1-connect-sync",
+        version="2.8.2-payment-wins",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -957,7 +957,7 @@ async def create_checkout_session(
     order_id = str(uuid.uuid4())
     try:
         order = await asyncio.to_thread(
-            database.reserve_order,
+            database.create_pending_order,
             order_id,
             payload.listing_id,
             current_user["id"],
@@ -1038,9 +1038,37 @@ async def stripe_webhook(
         event = stripe_client.Webhook.construct_event(payload, stripe_signature, settings.stripe_webhook_secret)
     except Exception as exc:
         raise HTTPException(400, "Invalid Stripe webhook signature.") from exc
-    if event.get("type") in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
-        session = event["data"]["object"]
-        await asyncio.to_thread(database.mark_order_paid, session.get("id"), session.get("payment_intent"))
+    event_type = event.get("type")
+    if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
+        checkout = event["data"]["object"]
+        # Delayed payment methods also emit checkout.session.completed before
+        # funds succeed. They must wait for async_payment_succeeded.
+        if event_type == "checkout.session.completed" and checkout.get("payment_status") != "paid":
+            return {"received": True}
+        payment_intent_id = checkout.get("payment_intent")
+        result = await asyncio.to_thread(
+            database.claim_order_payment,
+            checkout.get("id"),
+            payment_intent_id,
+        )
+        if result and not result["won"] and not result["already_processed"]:
+            order = result["order"]
+            if not payment_intent_id:
+                logger.error("Losing checkout %s has no payment intent to refund", checkout.get("id"))
+                raise HTTPException(502, "Paid checkout could not be refunded yet.")
+            try:
+                refund = await asyncio.to_thread(
+                    stripe_client.Refund.create,
+                    payment_intent=payment_intent_id,
+                    metadata={"order_id": order["id"], "reason": "listing_already_sold"},
+                    idempotency_key=f"pokemarket-losing-order-{order['id']}",
+                )
+                await asyncio.to_thread(database.mark_order_refunded, order["id"], refund["id"])
+            except Exception as exc:
+                logger.exception("Automatic refund failed for losing order %s", order["id"])
+                # A non-2xx response makes Stripe retry the webhook. The refund
+                # request is idempotent, so a retry cannot issue two refunds.
+                raise HTTPException(502, "Automatic refund is pending retry.") from exc
     return {"received": True}
 
 

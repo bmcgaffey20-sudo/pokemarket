@@ -189,6 +189,7 @@ class Order(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     payout_status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
     stripe_transfer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    stripe_refund_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
@@ -235,6 +236,8 @@ class Database:
                 connection.execute(text("ALTER TABLE orders ADD COLUMN payout_status VARCHAR(24) NOT NULL DEFAULT 'pending'"))
             if "stripe_transfer_id" not in order_columns:
                 connection.execute(text("ALTER TABLE orders ADD COLUMN stripe_transfer_id VARCHAR(128)"))
+            if "stripe_refund_id" not in order_columns:
+                connection.execute(text("ALTER TABLE orders ADD COLUMN stripe_refund_id VARCHAR(128)"))
 
     def ping(self):
         with self.engine.connect() as connection:
@@ -566,25 +569,28 @@ class Database:
             "tracking_number": order.tracking_number, "delivered_at": order.delivered_at,
             "hold_until": order.hold_until, "completed_at": order.completed_at,
             "payout_status": order.payout_status, "stripe_transfer_id": order.stripe_transfer_id,
+            "stripe_refund_id": order.stripe_refund_id,
             "created_at": order.created_at, "updated_at": order.updated_at,
         }
 
-    def reserve_order(self, order_id, listing_id, buyer_id, commission_percent, shipping_cents=0):
+    def create_pending_order(self, order_id, listing_id, buyer_id, commission_percent, shipping_cents=0):
+        """Create a checkout attempt without reserving the one-of-one listing."""
         with self.sessions.begin() as session:
             listing = session.get(Listing, listing_id, with_for_update=True)
             if listing is None or listing.status != "published" or not listing.publication_approved:
                 raise ListingValidationError("This card is no longer available.")
             if listing.seller_id == buyer_id:
                 raise ListingValidationError("You cannot buy your own listing.")
-            active = session.execute(select(Order).where(Order.listing_id == listing_id, Order.status.in_(("pending_payment", "paid", "shipped", "delivered", "protection_hold")))).scalar_one_or_none()
-            if active is not None:
-                raise DatabaseOperationError("This card is already reserved or sold.")
             item_cents = int(listing.price_cents or 0)
             commission_cents = (item_cents * commission_percent + 99) // 100
             order = Order(id=order_id, listing_id=listing_id, buyer_id=buyer_id, seller_id=listing.seller_id, item_cents=item_cents, shipping_cents=shipping_cents, commission_cents=commission_cents, seller_amount_cents=item_cents - commission_cents, currency=listing.currency)
             session.add(order)
             session.flush()
             return self._order_dict(order)
+
+    # Kept for callers from the previous backend release. Pending checkouts no
+    # longer reserve inventory; only a confirmed payment can claim a listing.
+    reserve_order = create_pending_order
 
     def attach_checkout_session(self, order_id, session_id):
         with self.sessions.begin() as session:
@@ -603,19 +609,54 @@ class Database:
                 order.updated_at = utc_now()
             return self._order_dict(order) if order else None
 
-    def mark_order_paid(self, session_id, payment_intent_id=None):
+    def claim_order_payment(self, session_id, payment_intent_id=None):
+        """Atomically let the first confirmed payment claim the listing."""
         with self.sessions.begin() as session:
             order = session.execute(select(Order).where(Order.stripe_checkout_session_id == session_id).with_for_update()).scalar_one_or_none()
             if order is None:
                 return None
-            if order.status == "pending_payment":
+            if order.status in {"paid", "shipped", "delivered", "protection_hold", "completed"}:
+                return {"won": True, "already_processed": True, "order": self._order_dict(order)}
+            if order.status == "refunded":
+                return {"won": False, "already_processed": True, "order": self._order_dict(order)}
+            if order.status == "refund_pending":
+                return {"won": False, "already_processed": False, "order": self._order_dict(order)}
+            if order.status != "pending_payment":
+                return {"won": False, "already_processed": True, "order": self._order_dict(order)}
+
+            listing = session.get(Listing, order.listing_id, with_for_update=True)
+            if listing and listing.status == "published" and listing.publication_approved:
                 order.status = "paid"
                 order.stripe_payment_intent_id = payment_intent_id
-                listing = session.get(Listing, order.listing_id, with_for_update=True)
-                if listing:
-                    listing.status = "sold"
-                    listing.publication_approved = False
+                listing.status = "sold"
+                listing.publication_approved = False
+                listing.updated_at = utc_now()
+                order.updated_at = utc_now()
+                session.flush()
+                return {"won": True, "already_processed": False, "order": self._order_dict(order)}
+
+            order.status = "refund_pending"
+            order.stripe_payment_intent_id = payment_intent_id
+            order.payout_status = "not_applicable"
+            order.updated_at = utc_now()
+            session.flush()
+            return {"won": False, "already_processed": False, "order": self._order_dict(order)}
+
+    def mark_order_refunded(self, order_id, refund_id):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None:
+                return None
+            if order.status == "refund_pending":
+                order.status = "refunded"
+                order.stripe_refund_id = refund_id
+                order.updated_at = utc_now()
             return self._order_dict(order)
+
+    def mark_order_paid(self, session_id, payment_intent_id=None):
+        """Compatibility wrapper returning the claimed order, if any."""
+        result = self.claim_order_payment(session_id, payment_intent_id)
+        return result["order"] if result else None
 
     def get_order(self, order_id, user_id):
         with self.sessions() as session:

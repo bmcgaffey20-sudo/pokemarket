@@ -99,6 +99,7 @@ class OrderResponse(BaseModel):
     completed_at: datetime | None = None
     payout_status: str = "pending"
     stripe_transfer_id: str | None = None
+    stripe_refund_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
