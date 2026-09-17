@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     r2_access_key_id: str | None = None
     r2_secret_access_key: str | None = None
     r2_presigned_url_expiry_seconds: int = 3600
+    stripe_secret_key: str | None = None
+    stripe_publishable_key: str | None = None
+    stripe_webhook_secret: str | None = None
+    marketplace_commission_percent: int = 4
+    ebay_commission_percent: int = 1
+    seller_hold_days: int = 10
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
     @property
@@ -54,6 +60,10 @@ class Settings(BaseSettings):
         from email.utils import parseaddr
         sender = parseaddr(self.email_from or "")[1]
         return bool((self.mailjet_api_key or "").strip() and (self.mailjet_secret_key or "").strip() and "@" in sender and not any(c in (self.email_from or "") for c in "\r\n") and url.scheme == "https" and url.netloc and not url.username and not url.query and not url.fragment)
+
+    @property
+    def stripe_configured(self):
+        return bool((self.stripe_secret_key or "").strip() and (self.stripe_publishable_key or "").strip())
 
 @lru_cache
 def get_settings():

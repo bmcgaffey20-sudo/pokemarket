@@ -37,6 +37,8 @@ The service creates three tables on first connection:
   and timestamps.
 - `listing_images`: label, permanent R2 object key, MIME type, byte size, order,
   and whether the image is a defect close-up.
+- `orders`: buyer, seller, listing, Stripe payment state, 4% marketplace
+  commission, delivery-protection hold, and seller payout state.
 
 Originals use versioned private keys such as:
 
@@ -60,6 +62,22 @@ Listing endpoints:
 - `GET /api/v1/listings` retrieves the most recently updated listings.
 - Both image-upload endpoints create a seller-owned blank draft listing
   automatically when the listing ID does not yet exist.
+
+Checkout and orders:
+
+- `POST /api/v1/payments/connect/onboard` creates a Stripe Express seller
+  onboarding link. A seller must finish this before buyers can pay.
+- `POST /api/v1/payments/checkout` reserves a published card and creates a
+  Stripe Checkout Session in test mode. The 4% PokeMarket commission is stored
+  on the order; shipping is collected separately and is not counted as seller
+  commission.
+- `POST /api/v1/payments/webhook` confirms payment from Stripe's signed
+  `checkout.session.completed` event. Configure `STRIPE_WEBHOOK_SECRET` from
+  the Stripe Dashboard webhook endpoint.
+- `GET /api/v1/orders` and `GET /api/v1/orders/{id}` show buyer/seller orders.
+- Sellers can add tracking; buyers confirm delivery; completion is blocked
+  until the 10-day protection hold ends. Only then is the seller transfer
+  created and the seller's trust-tier counters updated.
 
 This version is intentionally flat. Upload every extracted file directly into
 your existing GitHub folder:
@@ -89,6 +107,9 @@ R2_BUCKET_NAME=pokemart-images
 R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
 R2_ACCESS_KEY_ID=<your Cloudflare access key ID>
 R2_SECRET_ACCESS_KEY=<your Cloudflare secret access key>
+STRIPE_SECRET_KEY=sk_test_<your Stripe test secret>
+STRIPE_PUBLISHABLE_KEY=pk_test_<your Stripe test publishable key>
+STRIPE_WEBHOOK_SECRET=whsec_<your Stripe test webhook signing secret>
 
 Generate `AUTH_SECRET` and `LEGACY_CLAIM_CODE` separately on Windows with:
 
@@ -97,9 +118,9 @@ Generate `AUTH_SECRET` and `LEGACY_CLAIM_CODE` separately on Windows with:
 Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
-After deployment, `/api/v1/health` should include:
-
-`"version":"2.5.0-user-accounts","database":"connected","auth":"configured"`
+After deployment, `/api/v1/health` should include version
+`2.8.0-checkout`, `database:"connected"`, `auth:"configured"`, and
+`payments:"configured"` when both Stripe test keys are present.
 
 At startup, SQLAlchemy creates the users table and safely adds `seller_id` to the
 existing listings table. Add Alembic migrations before later production schema

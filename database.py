@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import time
 
@@ -93,6 +93,7 @@ class User(Base):
     successful_sales: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     successful_sales_over_100: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_listing_cents: Mapped[int | None] = mapped_column(Integer, default=8_000, nullable=True)
+    stripe_account_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
 
 
 class AccountAction(Base):
@@ -166,6 +167,32 @@ class ListingImage(Base):
     listing: Mapped[Listing] = relationship(back_populates="images")
 
 
+class Order(Base):
+    __tablename__ = "orders"
+    __table_args__ = (UniqueConstraint("stripe_checkout_session_id", name="uq_order_checkout_session"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    listing_id: Mapped[str] = mapped_column(String(64), ForeignKey("listings.id", ondelete="RESTRICT"), index=True)
+    buyer_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    seller_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending_payment", nullable=False, index=True)
+    item_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    shipping_cents: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    commission_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    seller_amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), default="USD", nullable=False)
+    stripe_checkout_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    stripe_payment_intent_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    tracking_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hold_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    payout_status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
+    stripe_transfer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
 class Database:
     def __init__(self, database_url):
         url = normalize_database_url(database_url)
@@ -198,6 +225,16 @@ class Database:
             connection.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_listings_seller_id ON listings (seller_id)")
             )
+        user_columns = {column["name"] for column in inspect(self.engine).get_columns("users")}
+        if "stripe_account_id" not in user_columns:
+            with self.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE users ADD COLUMN stripe_account_id VARCHAR(64)"))
+        order_columns = {column["name"] for column in inspect(self.engine).get_columns("orders")}
+        with self.engine.begin() as connection:
+            if "payout_status" not in order_columns:
+                connection.execute(text("ALTER TABLE orders ADD COLUMN payout_status VARCHAR(24) NOT NULL DEFAULT 'pending'"))
+            if "stripe_transfer_id" not in order_columns:
+                connection.execute(text("ALTER TABLE orders ADD COLUMN stripe_transfer_id VARCHAR(128)"))
 
     def ping(self):
         with self.engine.connect() as connection:
@@ -217,6 +254,8 @@ class Database:
             "successful_sales": user.successful_sales,
             "successful_sales_over_100": user.successful_sales_over_100,
             "max_listing_cents": user.max_listing_cents,
+            "stripe_account_id": user.stripe_account_id,
+            "stripe_connected": bool(user.stripe_account_id),
         }
 
     @staticmethod
@@ -309,6 +348,14 @@ class Database:
         with self.sessions() as session:
             user = session.get(User, user_id)
             return self._user_dict(user) if user else None
+
+    def set_stripe_account(self, user_id, account_id):
+        with self.sessions.begin() as session:
+            user = session.get(User, user_id, with_for_update=True)
+            if user is None:
+                return None
+            user.stripe_account_id = account_id
+            return self._user_dict(user)
 
     def take_auth_rate(self, key, limit, seconds, now=None):
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -506,3 +553,141 @@ class Database:
                 .offset(offset)
             ).scalars().all()
             return [self._listing_dict(listing) for listing in listings]
+
+    @staticmethod
+    def _order_dict(order):
+        return {
+            "id": order.id, "listing_id": order.listing_id, "buyer_id": order.buyer_id,
+            "seller_id": order.seller_id, "status": order.status,
+            "item_cents": order.item_cents, "shipping_cents": order.shipping_cents,
+            "commission_cents": order.commission_cents, "seller_amount_cents": order.seller_amount_cents,
+            "currency": order.currency, "stripe_checkout_session_id": order.stripe_checkout_session_id,
+            "stripe_payment_intent_id": order.stripe_payment_intent_id,
+            "tracking_number": order.tracking_number, "delivered_at": order.delivered_at,
+            "hold_until": order.hold_until, "completed_at": order.completed_at,
+            "payout_status": order.payout_status, "stripe_transfer_id": order.stripe_transfer_id,
+            "created_at": order.created_at, "updated_at": order.updated_at,
+        }
+
+    def reserve_order(self, order_id, listing_id, buyer_id, commission_percent, shipping_cents=0):
+        with self.sessions.begin() as session:
+            listing = session.get(Listing, listing_id, with_for_update=True)
+            if listing is None or listing.status != "published" or not listing.publication_approved:
+                raise ListingValidationError("This card is no longer available.")
+            if listing.seller_id == buyer_id:
+                raise ListingValidationError("You cannot buy your own listing.")
+            active = session.execute(select(Order).where(Order.listing_id == listing_id, Order.status.in_(("pending_payment", "paid", "shipped", "delivered", "protection_hold")))).scalar_one_or_none()
+            if active is not None:
+                raise DatabaseOperationError("This card is already reserved or sold.")
+            item_cents = int(listing.price_cents or 0)
+            commission_cents = (item_cents * commission_percent + 99) // 100
+            order = Order(id=order_id, listing_id=listing_id, buyer_id=buyer_id, seller_id=listing.seller_id, item_cents=item_cents, shipping_cents=shipping_cents, commission_cents=commission_cents, seller_amount_cents=item_cents - commission_cents, currency=listing.currency)
+            session.add(order)
+            session.flush()
+            return self._order_dict(order)
+
+    def attach_checkout_session(self, order_id, session_id):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None:
+                return None
+            order.stripe_checkout_session_id = session_id
+            order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def cancel_order(self, order_id):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order and order.status == "pending_payment":
+                order.status = "canceled"
+                order.updated_at = utc_now()
+            return self._order_dict(order) if order else None
+
+    def mark_order_paid(self, session_id, payment_intent_id=None):
+        with self.sessions.begin() as session:
+            order = session.execute(select(Order).where(Order.stripe_checkout_session_id == session_id).with_for_update()).scalar_one_or_none()
+            if order is None:
+                return None
+            if order.status == "pending_payment":
+                order.status = "paid"
+                order.stripe_payment_intent_id = payment_intent_id
+                listing = session.get(Listing, order.listing_id, with_for_update=True)
+                if listing:
+                    listing.status = "sold"
+                    listing.publication_approved = False
+            return self._order_dict(order)
+
+    def get_order(self, order_id, user_id):
+        with self.sessions() as session:
+            order = session.get(Order, order_id)
+            if order is None or user_id not in {order.buyer_id, order.seller_id}:
+                return None
+            return self._order_dict(order)
+
+    def confirm_delivery(self, order_id, buyer_id, hold_days):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None or order.buyer_id != buyer_id:
+                return None
+            if order.status not in {"paid", "shipped", "delivered"}:
+                raise ListingValidationError("This order is not ready for delivery confirmation.")
+            order.status = "protection_hold"
+            order.delivered_at = order.delivered_at or utc_now()
+            order.hold_until = order.hold_until or utc_now() + timedelta(days=hold_days)
+            order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def list_orders(self, user_id, limit=50, offset=0):
+        with self.sessions() as session:
+            orders = session.execute(
+                select(Order).where((Order.buyer_id == user_id) | (Order.seller_id == user_id))
+                .order_by(Order.created_at.desc()).limit(limit).offset(offset)
+            ).scalars().all()
+            return [self._order_dict(order) for order in orders]
+
+    def mark_payout(self, order_id, status, transfer_id=None):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None:
+                return None
+            order.payout_status = status
+            if transfer_id:
+                order.stripe_transfer_id = transfer_id
+            order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def set_tracking(self, order_id, seller_id, tracking_number):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None or order.seller_id != seller_id:
+                return None
+            if order.status not in {"paid", "shipped"}:
+                raise ListingValidationError("Tracking can only be added to a paid order.")
+            order.tracking_number = tracking_number
+            order.status = "shipped"
+            order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def complete_order(self, order_id, user_id):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None or user_id not in {order.buyer_id, order.seller_id}:
+                return None
+            if order.status != "protection_hold" or not order.hold_until or order.hold_until > utc_now():
+                raise ListingValidationError("The 10-day buyer-protection period has not ended.")
+            order.status = "completed"
+            order.completed_at = utc_now()
+            buyer, seller = session.get(User, order.buyer_id), session.get(User, order.seller_id)
+            buyer.completed_buys += 1
+            seller.successful_sales += 1
+            if order.item_cents >= 10_000:
+                seller.successful_sales_over_100 += 1
+            if seller.successful_sales_over_100 >= 5:
+                seller.seller_tier, seller.max_listing_cents = 5, 100_000
+            elif seller.completed_buys >= 5 and seller.successful_sales >= 5:
+                seller.seller_tier, seller.max_listing_cents = 4, 25_000
+            elif seller.completed_buys >= 3 and seller.successful_sales >= 3:
+                seller.seller_tier, seller.max_listing_cents = 3, 20_000
+            elif seller.completed_buys >= 1 or seller.successful_sales >= 1:
+                seller.seller_tier, seller.max_listing_cents = 2, 10_000
+            return self._order_dict(order)

@@ -5,12 +5,18 @@ import logging
 import traceback
 import uuid
 from functools import lru_cache
+from urllib.parse import urlparse
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile, Request
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+try:
+    import stripe
+except ImportError:  # Tests can run without payment SDK installed.
+    stripe = None
 
 from ai import get_ai_provider, new_scan_id
 from auth import (
@@ -42,6 +48,11 @@ from schemas import (
     RegisterRequest,
     ScanAnalysisResponse,
     UserResponse,
+    CheckoutRequest,
+    CheckoutResponse,
+    OrderResponse,
+    CheckoutProviderResponse,
+    TrackingRequest,
 )
 from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
@@ -54,7 +65,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.7.1-mailjet")
+app = FastAPI(title=settings.app_name, version="2.8.0-checkout")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -164,11 +175,12 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.7.1-mailjet",
+        version="2.8.0-checkout",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
         email="configured" if settings.email_configured else "not_configured",
+        payments="configured" if settings.stripe_configured and stripe is not None else "not_configured",
     )
 
 
@@ -803,3 +815,214 @@ async def upload_only(
 ):
     """Compatibility route for the Android scan client."""
     return await persist_images(listing_id, files, current_user["id"], database)
+
+
+def require_stripe():
+    if stripe is None or not settings.stripe_secret_key:
+        raise HTTPException(503, "Stripe test payments are not configured on the backend.")
+    stripe.api_key = settings.stripe_secret_key
+    return stripe
+
+
+def safe_checkout_url(value, default):
+    candidate = (value or default).strip()
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+        raise HTTPException(422, "Checkout return URLs must be complete http(s) URLs.")
+    return candidate
+
+
+@app.post("/api/v1/payments/connect/onboard", response_model=CheckoutProviderResponse)
+async def onboard_seller(current_user=Depends(require_user), database=Depends(require_database)):
+    stripe_client = require_stripe()
+    account_id = current_user.get("stripe_account_id")
+    try:
+        if not account_id:
+            account = await asyncio.to_thread(
+                stripe_client.Account.create,
+                type="express",
+                country="US",
+                email=current_user["email"],
+                capabilities={"card_payments": {"requested": True}, "transfers": {"requested": True}},
+                business_profile={"name": "PokeMarket seller"},
+            )
+            account_id = account["id"]
+            await asyncio.to_thread(database.set_stripe_account, current_user["id"], account_id)
+        base = settings.public_base_url.rstrip("/")
+        link = await asyncio.to_thread(
+            stripe_client.AccountLink.create,
+            account=account_id,
+            refresh_url=f"{base}/api/v1/payments/connect/refresh",
+            return_url=f"{base}/api/v1/payments/connect/return",
+            type="account_onboarding",
+        )
+    except Exception as exc:
+        logger.exception("Stripe seller onboarding failed")
+        raise HTTPException(502, "Stripe could not start seller payout setup.") from exc
+    return CheckoutProviderResponse(url=link["url"], stripe_account_id=account_id)
+
+
+@app.post("/api/v1/payments/checkout", response_model=CheckoutResponse)
+async def create_checkout_session(
+    payload: CheckoutRequest,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
+    stripe_client = require_stripe()
+    order_id = str(uuid.uuid4())
+    try:
+        order = await asyncio.to_thread(
+            database.reserve_order,
+            order_id,
+            payload.listing_id,
+            current_user["id"],
+            settings.marketplace_commission_percent,
+            payload.shipping_cents,
+        )
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except DatabaseOperationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    seller = await asyncio.to_thread(database.get_user, order["seller_id"])
+    account_id = seller.get("stripe_account_id") if seller else None
+    if not account_id:
+        await asyncio.to_thread(database.cancel_order, order_id)
+        raise HTTPException(409, "This seller has not completed Stripe payout setup yet.")
+    try:
+        account = await asyncio.to_thread(stripe_client.Account.retrieve, account_id)
+        if not account.get("charges_enabled") or not account.get("payouts_enabled"):
+            await asyncio.to_thread(database.cancel_order, order_id)
+            raise HTTPException(409, "This seller's payout account is still being verified.")
+        listings = await asyncio.to_thread(database.marketplace, listing_id=payload.listing_id)
+        listing = listings[0] if listings else {}
+        title = listing.get("title") or listing.get("card_name") or "PokeMarket card"
+        base = settings.public_base_url.rstrip("/")
+        success_url = safe_checkout_url(payload.success_url, f"{base}/checkout/success?session_id={{CHECKOUT_SESSION_ID}}")
+        cancel_url = safe_checkout_url(payload.cancel_url, f"{base}/checkout/cancelled")
+        line_items = [{
+            "price_data": {"currency": order["currency"].lower(), "product_data": {"name": title}, "unit_amount": order["item_cents"]},
+            "quantity": 1,
+        }]
+        if order["shipping_cents"]:
+            line_items.append({
+                "price_data": {"currency": order["currency"].lower(), "product_data": {"name": "Shipping"}, "unit_amount": order["shipping_cents"]},
+                "quantity": 1,
+            })
+        session = await asyncio.to_thread(
+            stripe_client.checkout.Session.create,
+            mode="payment",
+            line_items=line_items,
+            success_url=success_url,
+            cancel_url=cancel_url,
+            customer_email=current_user["email"],
+            metadata={"order_id": order_id, "listing_id": payload.listing_id},
+            payment_intent_data={"metadata": {"order_id": order_id}},
+        )
+        await asyncio.to_thread(database.attach_checkout_session, order_id, session["id"])
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await asyncio.to_thread(database.cancel_order, order_id)
+        logger.exception("Stripe checkout session creation failed")
+        raise HTTPException(502, "Stripe could not create the checkout session.") from exc
+    return CheckoutResponse(
+        order_id=order_id,
+        checkout_url=session["url"],
+        stripe_session_id=session["id"],
+        item_cents=order["item_cents"],
+        shipping_cents=order["shipping_cents"],
+        commission_cents=order["commission_cents"],
+        seller_amount_cents=order["seller_amount_cents"],
+        currency=order["currency"],
+    )
+
+
+@app.post("/api/v1/payments/webhook")
+async def stripe_webhook(
+    payload: bytes = Body(...),
+    stripe_signature: str | None = Header(default=None, alias="Stripe-Signature"),
+    database=Depends(require_database),
+):
+    stripe_client = require_stripe()
+    if not settings.stripe_webhook_secret:
+        raise HTTPException(503, "STRIPE_WEBHOOK_SECRET is not configured yet.")
+    if not stripe_signature:
+        raise HTTPException(400, "Stripe-Signature header is required.")
+    try:
+        event = stripe_client.Webhook.construct_event(payload, stripe_signature, settings.stripe_webhook_secret)
+    except Exception as exc:
+        raise HTTPException(400, "Invalid Stripe webhook signature.") from exc
+    if event.get("type") in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
+        session = event["data"]["object"]
+        await asyncio.to_thread(database.mark_order_paid, session.get("id"), session.get("payment_intent"))
+    return {"received": True}
+
+
+@app.get("/api/v1/orders", response_model=list[OrderResponse])
+async def read_orders(
+    limit: int = 50,
+    offset: int = 0,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
+    if not 1 <= limit <= 100 or offset < 0:
+        raise HTTPException(400, "Invalid pagination.")
+    return await asyncio.to_thread(database.list_orders, current_user["id"], limit, offset)
+
+
+@app.get("/api/v1/orders/{order_id}", response_model=OrderResponse)
+async def read_order(order_id: str, current_user=Depends(require_user), database=Depends(require_database)):
+    order = await asyncio.to_thread(database.get_order, order_id, current_user["id"])
+    if order is None:
+        raise HTTPException(404, "Order not found.")
+    return order
+
+
+@app.post("/api/v1/orders/{order_id}/tracking", response_model=OrderResponse)
+async def add_order_tracking(order_id: str, payload: TrackingRequest, current_user=Depends(require_user), database=Depends(require_database)):
+    try:
+        order = await asyncio.to_thread(database.set_tracking, order_id, current_user["id"], payload.tracking_number.strip())
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if order is None:
+        raise HTTPException(404, "Order not found.")
+    return order
+
+
+@app.post("/api/v1/orders/{order_id}/confirm-delivery", response_model=OrderResponse)
+async def confirm_order_delivery(order_id: str, current_user=Depends(require_user), database=Depends(require_database)):
+    try:
+        order = await asyncio.to_thread(database.confirm_delivery, order_id, current_user["id"], settings.seller_hold_days)
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if order is None:
+        raise HTTPException(404, "Order not found.")
+    return order
+
+
+@app.post("/api/v1/orders/{order_id}/complete", response_model=OrderResponse)
+async def complete_order(order_id: str, current_user=Depends(require_user), database=Depends(require_database)):
+    try:
+        order = await asyncio.to_thread(database.complete_order, order_id, current_user["id"])
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if order is None:
+        raise HTTPException(404, "Order not found.")
+    seller = await asyncio.to_thread(database.get_user, order["seller_id"])
+    account_id = seller.get("stripe_account_id") if seller else None
+    if account_id and order["seller_amount_cents"] > 0:
+        try:
+            stripe_client = require_stripe()
+            transfer = await asyncio.to_thread(
+                stripe_client.Transfer.create,
+                amount=order["seller_amount_cents"],
+                currency=order["currency"].lower(),
+                destination=account_id,
+                metadata={"order_id": order["id"], "listing_id": order["listing_id"]},
+            )
+            order = await asyncio.to_thread(database.mark_payout, order["id"], "paid", transfer["id"])
+        except Exception:
+            logger.exception("Seller payout failed for order %s", order_id)
+            order = await asyncio.to_thread(database.mark_payout, order["id"], "failed")
+    return order

@@ -14,6 +14,7 @@ class HealthResponse(BaseModel):
     database: str
     auth: str
     email: str = "not_configured"
+    payments: str = "not_configured"
 
 class RegisterRequest(BaseModel):
     email: str = Field(min_length=5, max_length=254)
@@ -57,6 +58,52 @@ class UserResponse(BaseModel):
     successful_sales: int
     successful_sales_over_100: int
     max_listing_cents: int | None
+    stripe_connected: bool = False
+
+class CheckoutRequest(BaseModel):
+    listing_id: str = Field(min_length=1, max_length=64)
+    success_url: str | None = Field(default=None, max_length=1000)
+    cancel_url: str | None = Field(default=None, max_length=1000)
+    shipping_cents: int = Field(default=0, ge=0, le=100_000)
+
+class CheckoutResponse(BaseModel):
+    order_id: str
+    checkout_url: str
+    stripe_session_id: str
+    item_cents: int
+    shipping_cents: int
+    commission_cents: int
+    seller_amount_cents: int
+    currency: str
+
+class OrderResponse(BaseModel):
+    id: str
+    listing_id: str
+    buyer_id: str
+    seller_id: str
+    status: str
+    item_cents: int
+    shipping_cents: int
+    commission_cents: int
+    seller_amount_cents: int
+    currency: str
+    stripe_checkout_session_id: str | None = None
+    stripe_payment_intent_id: str | None = None
+    tracking_number: str | None = None
+    delivered_at: datetime | None = None
+    hold_until: datetime | None = None
+    completed_at: datetime | None = None
+    payout_status: str = "pending"
+    stripe_transfer_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+class TrackingRequest(BaseModel):
+    tracking_number: str = Field(min_length=3, max_length=128)
+
+class CheckoutProviderResponse(BaseModel):
+    url: str
+    stripe_account_id: str
 
 class AuthResponse(BaseModel):
     access_token: str

@@ -27,6 +27,12 @@ services:
         sync: false
       - key: PUBLIC_BASE_URL
         value: https://pokemarket-4jwi.onrender.com
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
       - key: LEGACY_CLAIM_CODE
         sync: false
       - key: R2_BUCKET_NAME
