@@ -59,6 +59,10 @@ class UserResponse(BaseModel):
     successful_sales_over_100: int
     max_listing_cents: int | None
     stripe_connected: bool = False
+    stripe_details_submitted: bool = False
+    stripe_charges_enabled: bool = False
+    stripe_payouts_enabled: bool = False
+    stripe_requirements_due: list[str] = Field(default_factory=list)
 
 class CheckoutRequest(BaseModel):
     listing_id: str = Field(min_length=1, max_length=64)

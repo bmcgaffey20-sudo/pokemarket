@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -65,7 +65,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.8.0-checkout")
+app = FastAPI(title=settings.app_name, version="2.8.1-connect-sync")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -159,6 +159,42 @@ def auth_response(user, legacy_listings_claimed=0):
     )
 
 
+async def user_with_stripe_status(user):
+    """Return public user data with live Stripe Connect readiness flags."""
+    result = dict(user)
+    result.update(
+        stripe_connected=False,
+        stripe_details_submitted=False,
+        stripe_charges_enabled=False,
+        stripe_payouts_enabled=False,
+        stripe_requirements_due=[],
+    )
+    account_id = user.get("stripe_account_id")
+    if not account_id or stripe is None or not settings.stripe_secret_key:
+        return result
+    try:
+        stripe.api_key = settings.stripe_secret_key
+        account = await asyncio.to_thread(stripe.Account.retrieve, account_id)
+        requirements = account.get("requirements") or {}
+        currently_due = list(requirements.get("currently_due") or [])
+        past_due = list(requirements.get("past_due") or [])
+        result.update(
+            stripe_details_submitted=bool(account.get("details_submitted")),
+            stripe_charges_enabled=bool(account.get("charges_enabled")),
+            stripe_payouts_enabled=bool(account.get("payouts_enabled")),
+            stripe_requirements_due=sorted(set(currently_due + past_due)),
+        )
+        result["stripe_connected"] = (
+            result["stripe_details_submitted"]
+            and result["stripe_charges_enabled"]
+            and result["stripe_payouts_enabled"]
+            and not result["stripe_requirements_due"]
+        )
+    except Exception:
+        logger.exception("Could not refresh Stripe Connect status for user %s", user.get("id"))
+    return result
+
+
 @app.get("/api/v1/health", response_model=HealthResponse)
 async def health():
     if not settings.database_url:
@@ -175,7 +211,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.8.0-checkout",
+        version="2.8.1-connect-sync",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -264,7 +300,7 @@ async def login(payload: LoginRequest, request: Request, database=Depends(requir
 
 @app.get("/api/v1/auth/me", response_model=UserResponse)
 async def read_current_user(current_user=Depends(require_user)):
-    return UserResponse(**current_user)
+    return UserResponse(**(await user_with_stripe_status(current_user)))
 
 
 install_recovery(app, settings, require_database, require_user)
@@ -860,6 +896,55 @@ async def onboard_seller(current_user=Depends(require_user), database=Depends(re
         logger.exception("Stripe seller onboarding failed")
         raise HTTPException(502, "Stripe could not start seller payout setup.") from exc
     return CheckoutProviderResponse(url=link["url"], stripe_account_id=account_id)
+
+
+def connect_return_page(title: str, message: str, action: str) -> HTMLResponse:
+    app_url = f"pokemarket://account?stripe={action}"
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Cache-Control" content="no-store">
+  <title>{title}</title>
+  <style>
+    body {{ font-family: system-ui, sans-serif; margin: 0; background: #faf5ff; color: #18181b; }}
+    main {{ max-width: 34rem; margin: 12vh auto; padding: 2rem; text-align: center; }}
+    a {{ display: block; padding: 1rem; border-radius: 999px; background: #4f46e5; color: white;
+         text-decoration: none; font-weight: 700; font-size: 1.1rem; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{title}</h1>
+    <p>{message}</p>
+    <a href="{app_url}">Return to PokeMarket</a>
+  </main>
+  <script>window.location.replace({app_url!r});</script>
+</body>
+</html>"""
+    return HTMLResponse(
+        html,
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+
+
+@app.get("/api/v1/payments/connect/return", response_class=HTMLResponse)
+async def connect_return():
+    return connect_return_page(
+        "Seller payout information submitted",
+        "Return to PokeMarket. The app will ask Stripe for the current verification and payout status.",
+        "return",
+    )
+
+
+@app.get("/api/v1/payments/connect/refresh", response_class=HTMLResponse)
+async def connect_refresh():
+    return connect_return_page(
+        "Seller payout link expired",
+        "Return to PokeMarket and tap Set Up Seller Payouts to continue with a fresh secure link.",
+        "refresh",
+    )
 
 
 @app.post("/api/v1/payments/checkout", response_model=CheckoutResponse)
