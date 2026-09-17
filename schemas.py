@@ -13,6 +13,7 @@ class HealthResponse(BaseModel):
     ai_provider: str
     database: str
     auth: str
+    email: str = "not_configured"
 
 class RegisterRequest(BaseModel):
     email: str = Field(min_length=5, max_length=254)
@@ -48,6 +49,7 @@ class LoginRequest(BaseModel):
 class UserResponse(BaseModel):
     id: str
     email: str
+    email_verified: bool = False
     display_name: str
     created_at: datetime
     seller_tier: int

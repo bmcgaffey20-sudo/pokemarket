@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     database_url: str | None = None
     auth_secret: str | None = None
     legacy_claim_code: str | None = None
+    mailjet_api_key: str | None = None
+    mailjet_secret_key: str | None = None
+    email_from: str | None = None
+    public_base_url: str = "https://pokemarket-4jwi.onrender.com"
     access_token_ttl_seconds: int = 2_592_000
     password_hash_iterations: int = 600_000
     r2_bucket_name: str | None = None
@@ -42,6 +46,14 @@ class Settings(BaseSettings):
     @property
     def auth_configured(self):
         return bool(self.auth_secret and len(self.auth_secret.strip()) >= 32)
+
+    @property
+    def email_configured(self):
+        from urllib.parse import urlsplit
+        url = urlsplit(self.public_base_url)
+        from email.utils import parseaddr
+        sender = parseaddr(self.email_from or "")[1]
+        return bool((self.mailjet_api_key or "").strip() and (self.mailjet_secret_key or "").strip() and "@" in sender and not any(c in (self.email_from or "") for c in "\r\n") and url.scheme == "https" and url.netloc and not url.username and not url.query and not url.fragment)
 
 @lru_cache
 def get_settings():

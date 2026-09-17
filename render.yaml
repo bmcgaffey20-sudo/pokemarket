@@ -19,6 +19,14 @@ services:
         sync: false
       - key: AUTH_SECRET
         sync: false
+      - key: MAILJET_API_KEY
+        sync: false
+      - key: MAILJET_SECRET_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: PUBLIC_BASE_URL
+        value: https://pokemarket-4jwi.onrender.com
       - key: LEGACY_CLAIM_CODE
         sync: false
       - key: R2_BUCKET_NAME

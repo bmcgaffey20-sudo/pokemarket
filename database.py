@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+import hashlib
+import time
 
 from sqlalchemy import (
     JSON,
@@ -78,6 +80,8 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     email: Mapped[str] = mapped_column(String(254), unique=True, nullable=False, index=True)
+    email_verified: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    session_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     display_name: Mapped[str] = mapped_column(String(80), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     password_salt: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -89,6 +93,22 @@ class User(Base):
     successful_sales: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     successful_sales_over_100: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_listing_cents: Mapped[int | None] = mapped_column(Integer, default=8_000, nullable=True)
+
+
+class AccountAction(Base):
+    __tablename__ = "account_actions"
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    purpose: Mapped[str] = mapped_column(String(16))
+    expires_at: Mapped[int] = mapped_column(BigInteger, index=True)
+    session_version: Mapped[int] = mapped_column(Integer)
+
+
+class AuthRateBucket(Base):
+    __tablename__ = "auth_rate_buckets"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    count: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[int] = mapped_column(BigInteger, index=True)
 
 
 class Listing(Base):
@@ -159,6 +179,11 @@ class Database:
 
     def initialize(self):
         Base.metadata.create_all(self.engine)
+        user_columns = {column["name"] for column in inspect(self.engine).get_columns("users")}
+        with self.engine.begin() as connection:
+            for name, definition in (("email_verified", "BOOLEAN NOT NULL DEFAULT false"), ("session_version", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in user_columns:
+                    connection.execute(text(f"ALTER TABLE users ADD COLUMN {name} {definition}"))
         # create_all is intentionally non-destructive and does not add columns to
         # the existing Neon table. Apply this one safe migration in place.
         columns = {column["name"] for column in inspect(self.engine).get_columns("listings")}
@@ -183,6 +208,8 @@ class Database:
         return {
             "id": user.id,
             "email": user.email,
+            "email_verified": user.email_verified,
+            "session_version": user.session_version,
             "display_name": user.display_name,
             "created_at": user.created_at,
             "seller_tier": user.seller_tier,
@@ -282,6 +309,52 @@ class Database:
         with self.sessions() as session:
             user = session.get(User, user_id)
             return self._user_dict(user) if user else None
+
+    def take_auth_rate(self, key, limit, seconds, now=None):
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        from sqlalchemy.dialects.postgresql import insert as postgres_insert
+        now = int(time.time()) if now is None else now
+        window = now // seconds
+        digest = hashlib.sha256(f"{key}:{window}".encode()).hexdigest()
+        insert = sqlite_insert if self.engine.dialect.name == "sqlite" else postgres_insert
+        with self.sessions.begin() as session:
+            session.execute(delete(AuthRateBucket).where(AuthRateBucket.expires_at < now))
+            statement = insert(AuthRateBucket).values(key=digest, count=1, expires_at=(window + 1) * seconds)
+            statement = statement.on_conflict_do_update(index_elements=["key"], set_={"count": AuthRateBucket.count + 1})
+            count = session.execute(statement.returning(AuthRateBucket.count)).scalar_one()
+        return count <= limit
+
+    def issue_account_action(self, user_id, purpose, token_hash, ttl):
+        now = int(time.time())
+        with self.sessions.begin() as session:
+            user = session.get(User, user_id, with_for_update=True)
+            if user is None or (purpose == "verify" and user.email_verified):
+                return None
+            session.execute(delete(AccountAction).where(AccountAction.expires_at <= now))
+            session.add(AccountAction(token_hash=token_hash, user_id=user.id, purpose=purpose, expires_at=now + ttl, session_version=user.session_version))
+            return user.email
+
+    def consume_account_action(self, token_hash, purpose, password=None):
+        now = int(time.time())
+        with self.sessions.begin() as session:
+            action = session.get(AccountAction, token_hash)
+            if action is None or action.purpose != purpose or action.expires_at <= now:
+                return False
+            user = session.get(User, action.user_id, with_for_update=True)
+            if user is None or action.session_version != user.session_version:
+                return False
+            # Conditional delete makes each token single-use even on SQLite.
+            removed = session.execute(delete(AccountAction).where(AccountAction.token_hash == token_hash, AccountAction.expires_at > now)).rowcount
+            if removed != 1:
+                return False
+            if purpose == "reset":
+                user.password_salt, user.password_hash, user.password_iterations = password
+                user.session_version += 1
+                session.execute(delete(AccountAction).where(AccountAction.user_id == user.id))
+            else:
+                user.email_verified = True
+                session.execute(delete(AccountAction).where(AccountAction.user_id == user.id, AccountAction.purpose == "verify"))
+            return True
 
     def record_login(self, user_id):
         with self.sessions.begin() as session:

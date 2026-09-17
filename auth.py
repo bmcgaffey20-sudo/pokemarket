@@ -66,11 +66,12 @@ def _require_secret(secret):
     return value.encode("utf-8")
 
 
-def create_access_token(user_id, secret, ttl_seconds):
+def create_access_token(user_id, secret, ttl_seconds, session_version=0):
     key = _require_secret(secret)
     now = int(time.time())
     payload = {
         "sub": user_id,
+        "ver": session_version,
         "iat": now,
         "exp": now + int(ttl_seconds),
         "nonce": secrets.token_urlsafe(8),

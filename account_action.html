@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PokeMarket Account</title>
+<style nonce="NONCE_PLACEHOLDER">body{font:18px system-ui;background:#f8f5ff;color:#202030;margin:0;padding:24px}main{max-width:460px;margin:40px auto;background:white;padding:24px;border-radius:18px}input,button{box-sizing:border-box;width:100%;padding:14px;margin:10px 0;font:inherit}button{background:#4f46e5;color:white;border:0;border-radius:10px}label{display:block}#message{white-space:pre-wrap}button:disabled{opacity:.6}</style></head>
+<body><main><h1>PokeMarket</h1><h2 id="title">Account confirmation</h2><p id="intro"></p>
+<form id="form"><div id="passwordFields" hidden><label>New password<input id="password" type="password" autocomplete="new-password" minlength="10" maxlength="128"></label><label>Confirm new password<input id="confirm" type="password" autocomplete="new-password" minlength="10" maxlength="128"></label></div><button id="submit" type="submit">Confirm</button></form><p id="message" role="status" aria-live="polite"></p></main>
+<script nonce="NONCE_PLACEHOLDER">
+const reset = location.pathname.endsWith('/reset');
+let token = location.hash.slice(1);
+history.replaceState(null, '', location.pathname);
+const form = document.getElementById('form'), message = document.getElementById('message'), button = document.getElementById('submit');
+document.getElementById('title').textContent = reset ? 'Reset your password' : 'Verify your email';
+document.getElementById('intro').textContent = reset ? 'Choose a password with 10–128 characters. This will invalidate all existing sign-ins.' : 'Press Confirm to verify ownership of your email address.';
+document.getElementById('passwordFields').hidden = !reset;
+if (!token) { message.textContent = 'Open the complete link from your email. If it expired, request a new one in the app.'; button.disabled = true; }
+form.addEventListener('submit', async event => {
+  event.preventDefault();
+  const password = document.getElementById('password').value;
+  if(reset && (password.length < 10 || password.length > 128 || password !== document.getElementById('confirm').value)) { message.textContent = 'Enter matching passwords of 10–128 characters.'; return; }
+  button.disabled = true; message.textContent = 'Please wait…';
+  try {
+    const response = await fetch(reset ? '/api/v1/auth/reset-password' : '/api/v1/auth/verify-email', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(reset ? {token,password} : {token}), cache:'no-store', credentials:'omit'});
+    const result = await response.json();
+    if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : 'Request could not be completed. Check the link and try again.');
+    message.textContent = result.message; token = ''; form.hidden = true; form.reset();
+  } catch(error) { message.textContent = error.message || 'Connection failed. Please try again.'; button.disabled = false; }
+});
+</script></body></html>

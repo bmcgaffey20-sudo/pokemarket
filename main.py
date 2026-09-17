@@ -6,7 +6,9 @@ import traceback
 import uuid
 from functools import lru_cache
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, UploadFile, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -43,6 +45,7 @@ from schemas import (
 )
 from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
+from recovery import install_recovery, limit_auth, send_action_email
 
 
 settings = get_settings()
@@ -51,9 +54,25 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.6.0-publish-listings")
+app = FastAPI(title=settings.app_name, version="2.7.1-mailjet")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_error(request: Request, exc):
+    # Never echo passwords, reset tokens or other submitted values in errors.
+    errors = [{"loc": error["loc"], "msg": error["msg"], "type": error["type"]} for error in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
+@app.middleware("http")
+async def private_account_responses(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith(("/api/v1/auth/", "/account/")):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 async def acquire_scan_slot():
@@ -106,6 +125,8 @@ async def require_user(
     user = await asyncio.to_thread(database.get_user, payload["sub"])
     if user is None:
         raise HTTPException(401, "Account no longer exists.", headers={"WWW-Authenticate": "Bearer"})
+    if payload.get("ver", 0) != user["session_version"]:
+        raise HTTPException(401, "Your session was invalidated. Sign in again.", headers={"WWW-Authenticate": "Bearer"})
     return user
 
 
@@ -115,6 +136,7 @@ def auth_response(user, legacy_listings_claimed=0):
             user["id"],
             settings.auth_secret,
             settings.access_token_ttl_seconds,
+            user.get("session_version", 0),
         )
     except AuthConfigurationError as exc:
         raise HTTPException(503, str(exc)) from exc
@@ -142,15 +164,17 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.6.0-publish-listings",
+        version="2.7.1-mailjet",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
+        email="configured" if settings.email_configured else "not_configured",
     )
 
 
 @app.post("/api/v1/auth/register", response_model=AuthResponse, status_code=201)
-async def register(payload: RegisterRequest, database=Depends(require_database)):
+async def register(payload: RegisterRequest, request: Request, background: BackgroundTasks, database=Depends(require_database)):
+    await limit_auth(database, request, "register", payload.email, 5)
     if not settings.auth_configured:
         raise HTTPException(503, "AUTH_SECRET must be configured before accounts can be created.")
     claim_legacy = bool(payload.legacy_claim_code)
@@ -182,11 +206,14 @@ async def register(payload: RegisterRequest, database=Depends(require_database))
         raise HTTPException(409, str(exc)) from exc
     except DatabaseOperationError as exc:
         raise HTTPException(502, str(exc)) from exc
+    if settings.email_configured:
+        background.add_task(send_action_email, settings, database, user["email"], "verify")
     return auth_response(user, legacy_listings_claimed=claimed)
 
 
 @app.post("/api/v1/auth/login", response_model=AuthResponse)
-async def login(payload: LoginRequest, database=Depends(require_database)):
+async def login(payload: LoginRequest, request: Request, database=Depends(require_database)):
+    await limit_auth(database, request, "login", normalize_email(payload.email), 10)
     if not settings.auth_configured:
         raise HTTPException(503, "AUTH_SECRET must be configured before sign-in is available.")
     user = await asyncio.to_thread(database.get_user_by_email, normalize_email(payload.email))
@@ -199,6 +226,8 @@ async def login(payload: LoginRequest, database=Depends(require_database)):
             user["password_hash"],
             user["password_iterations"],
         )
+    else:
+        await asyncio.to_thread(hash_password, payload.password, settings.password_hash_iterations)
     if not valid:
         raise HTTPException(401, "Email or password is incorrect.")
     await asyncio.to_thread(database.record_login, user["id"])
@@ -207,6 +236,8 @@ async def login(payload: LoginRequest, database=Depends(require_database)):
         for key in (
             "id",
             "email",
+            "email_verified",
+            "session_version",
             "display_name",
             "created_at",
             "seller_tier",
@@ -222,6 +253,9 @@ async def login(payload: LoginRequest, database=Depends(require_database)):
 @app.get("/api/v1/auth/me", response_model=UserResponse)
 async def read_current_user(current_user=Depends(require_user)):
     return UserResponse(**current_user)
+
+
+install_recovery(app, settings, require_database, require_user)
 
 
 @app.get("/api/v1/cards/search", response_model=CardSearchResponse)

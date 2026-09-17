@@ -1,6 +1,7 @@
-# PokeMarket Backend 2.6.0 — Publish Listings
+# PokeMarket Backend 2.7.1 — Mailjet
 
-Read UPDATE-2.6.0.md first for deployment, migration, public-photo behavior and tests.
+Read UPDATE-2.7.1.md first for Mailjet setup, deployment and recovery testing.
+UPDATE-2.6.0.md documents publishing and public-photo behavior.
 
 Adds labelled defect close-ups, strict condition inspection, explicit major-defect
 reporting, confidence normalization, and a server-side safeguard that prevents a
