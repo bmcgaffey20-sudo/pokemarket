@@ -114,6 +114,14 @@ class FakeR2Client:
     def delete_object(self, **kwargs):
         self.objects.pop(kwargs["Key"], None)
 
+    def head_object(self, **kwargs):
+        value = self.objects[kwargs["Key"]]
+        body = value.get("Body", b"")
+        return {
+            "ContentLength": len(body),
+            "ContentType": value.get("ContentType", "application/octet-stream"),
+        }
+
 
 def test_r2_storage_uses_private_listing_paths():
     fake = FakeR2Client()
@@ -142,6 +150,38 @@ def test_r2_storage_uses_private_listing_paths():
         result[0]["object_key"],
     )
     assert result[0]["url"].startswith("https://signed.example/")
+
+
+def test_direct_r2_upload_session_and_verification():
+    fake = FakeR2Client()
+    storage = R2Storage(
+        type("Settings", (), {
+            "r2_bucket_name": "pokemart-images",
+            "r2_endpoint": "https://example.r2.cloudflarestorage.com",
+            "r2_access_key_id": "test",
+            "r2_secret_access_key": "test",
+            "r2_presigned_url_expiry_seconds": 3600,
+        })(),
+        client=fake,
+    )
+    upload_id, targets = storage.create_direct_upload_session(
+        "listing_123",
+        [{"label": "required_front_straight", "content_type": "image/jpeg", "size_bytes": 4}],
+    )
+    assert targets[0]["upload_url"].startswith("https://signed.example/")
+    fake.objects[targets[0]["object_key"]] = {"Body": b"jpeg", "ContentType": "image/jpeg"}
+    verified = storage.verify_direct_uploads(
+        "listing_123",
+        upload_id,
+        [{
+            "label": targets[0]["label"],
+            "object_key": targets[0]["object_key"],
+            "content_type": "image/jpeg",
+            "size_bytes": 4,
+        }],
+        12_000_000,
+    )
+    assert verified[0]["size_bytes"] == 4
 
 
 def test_render_postgres_url_uses_psycopg_driver():

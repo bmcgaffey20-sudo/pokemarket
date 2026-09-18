@@ -53,6 +53,9 @@ from schemas import (
     OrderResponse,
     CheckoutProviderResponse,
     TrackingRequest,
+    DirectUploadSessionRequest,
+    DirectUploadSessionResponse,
+    DirectUploadCompleteRequest,
 )
 from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
@@ -65,7 +68,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.9.0-orders")
+app = FastAPI(title=settings.app_name, version="2.10.0-bandwidth-optimized")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -368,9 +371,12 @@ async def read_images(files, forced_labels=None):
         labels.append(label)
         result.append((data, item.content_type, label))
 
-    # The Android client sends one best image per required angle, never all
-    # camera attempts. Enforce that contract server-side so duplicate frames
-    # cannot silently consume memory or dilute the analysis.
+    validate_image_labels(labels)
+    return result
+
+
+def validate_image_labels(labels):
+    """Apply the same evidence contract to multipart and direct uploads."""
     required = {
         "required_front_straight",
         "required_front_slight_left",
@@ -387,8 +393,6 @@ async def read_images(files, forced_labels=None):
     defect_count = sum(label.startswith("defect_") for label in labels)
     if defect_count > 5 or len(labels) != 4 + defect_count:
         raise HTTPException(400, "Send only the four required views and up to five defect close-ups.")
-
-    return result
 
 
 def as_plain_dict(value):
@@ -489,9 +493,10 @@ async def analyze_scan(
 
     try:
         provider = get_ai_provider(settings)
-
-        # Stage 1: identify the card from the supplied photographs.
-        identification = await provider.identify(images)
+        # Identification, condition and authenticity share one image-bearing
+        # request. This preserves the complete evidence set while avoiding a
+        # second Base64 copy of every photograph leaving Render.
+        combined = await provider.analyze(images)
 
     except ValueError as exc:
         logger.error(
@@ -516,11 +521,14 @@ async def analyze_scan(
             f"AI identification failed: {type(exc).__name__}: {exc}",
         ) from exc
 
-    identification = as_plain_dict(identification) or {}
+    combined = as_plain_dict(combined) or {}
+    identification = as_plain_dict(combined.get("identification")) or {}
     identification["confidence"] = normalize_confidence(
         identification.get("confidence")
     )
-    warnings = []
+    condition = as_plain_dict(combined.get("condition")) or {}
+    authenticity = as_plain_dict(combined.get("authenticity")) or {}
+    warnings = list(combined.get("warnings") or [])
 
     # Stage 2: resolve the AI proposal against TCGdex.
     match = None
@@ -558,34 +566,12 @@ async def analyze_scan(
             "No sufficiently strong TCGdex match was established."
         )
 
-    # Stage 3: condition/authenticity assessment grounded with TCGdex data.
-    try:
-        assessment = await provider.assess(
-            images,
-            identification,
-            match,
-        )
-
-    except Exception as exc:
-        logger.exception(
-            "AI assessment failed: %s: %s",
-            type(exc).__name__,
-            exc,
-        )
-        raise HTTPException(
-            502,
-            f"AI assessment failed: {type(exc).__name__}: {exc}",
-        ) from exc
-
-    assessment = as_plain_dict(assessment) or {}
-
-    condition = as_plain_dict(assessment.get("condition")) or {}
-    authenticity = as_plain_dict(assessment.get("authenticity")) or {}
     condition = apply_grading_safeguards(condition, images)
     authenticity["confidence"] = normalize_confidence(
         authenticity.get("confidence")
     )
-    warnings.extend(list(assessment.get("warnings") or []))
+    if match:
+        warnings.append("Identification was verified against TCGdex after visual analysis.")
 
     if not include_condition:
         condition = {"status": "disabled"}
@@ -839,6 +825,96 @@ async def upload_listing_images(
         current_user["id"],
         database,
         forced_labels=labels,
+    )
+
+
+@app.post(
+    "/api/v1/listings/{listing_id}/direct-upload-session",
+    response_model=DirectUploadSessionResponse,
+)
+async def create_direct_upload_session(
+    listing_id: str,
+    payload: DirectUploadSessionRequest,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
+    """Issue short-lived R2 PUT URLs; original image bytes bypass Render."""
+    labels = [image.label for image in payload.images]
+    validate_image_labels(labels)
+    if len(set(labels)) != len(labels):
+        raise HTTPException(400, "Every image label must be unique.")
+    try:
+        await asyncio.to_thread(database.ensure_listing_owner, listing_id, current_user["id"], True)
+        storage = get_r2_storage()
+        upload_id, uploads = await asyncio.to_thread(
+            storage.create_direct_upload_session,
+            listing_id,
+            [image.model_dump() for image in payload.images],
+        )
+    except (ValueError, ListingValidationError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ListingOwnershipError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (DatabaseOperationError, R2UploadError) as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return DirectUploadSessionResponse(
+        listing_id=listing_id,
+        upload_id=upload_id,
+        expires_in=settings.r2_presigned_url_expiry_seconds,
+        uploads=uploads,
+    )
+
+
+@app.post(
+    "/api/v1/listings/{listing_id}/direct-upload-complete",
+    response_model=ListingImageUploadResponse,
+)
+async def complete_direct_upload(
+    listing_id: str,
+    payload: DirectUploadCompleteRequest,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
+    """Verify directly uploaded originals and atomically attach them to a listing."""
+    labels = [image.label for image in payload.images]
+    validate_image_labels(labels)
+    if len(set(labels)) != len(labels):
+        raise HTTPException(400, "Every image label must be unique.")
+    storage = get_r2_storage()
+    image_dicts = [image.model_dump() for image in payload.images]
+    try:
+        await asyncio.to_thread(database.ensure_listing_owner, listing_id, current_user["id"], True)
+        verified = await asyncio.to_thread(
+            storage.verify_direct_uploads,
+            listing_id,
+            payload.upload_id,
+            image_dicts,
+            settings.max_image_bytes,
+        )
+        _, stale_keys = await asyncio.to_thread(
+            database.replace_images,
+            listing_id,
+            verified,
+            current_user["id"],
+        )
+    except (ValueError, ListingValidationError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ListingOwnershipError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (DatabaseOperationError, R2UploadError) as exc:
+        raise HTTPException(502, str(exc)) from exc
+    if stale_keys:
+        try:
+            await asyncio.to_thread(storage.delete_objects, stale_keys)
+        except R2UploadError:
+            logger.exception("Could not delete stale R2 objects for %s", listing_id)
+    return ListingImageUploadResponse(
+        status="stored",
+        listing_id=listing_id,
+        image_count=len(verified),
+        bytes=sum(image["size_bytes"] for image in verified),
+        persisted=True,
+        images=verified,
     )
 
 

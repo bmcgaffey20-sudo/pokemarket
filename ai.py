@@ -101,6 +101,17 @@ ASSESSMENT_SCHEMA = {
     "required": ["condition", "authenticity", "warnings"],
 }
 
+COMBINED_SCAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "identification": IDENTIFICATION_SCHEMA,
+        "condition": ASSESSMENT_SCHEMA["properties"]["condition"],
+        "authenticity": ASSESSMENT_SCHEMA["properties"]["authenticity"],
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["identification", "condition", "authenticity", "warnings"],
+}
+
 
 IDENTIFICATION_PROMPT = """
 You are the identification stage of PokeMarket's Pokemon trading card scanner.
@@ -170,6 +181,39 @@ Authenticity is preliminary visual screening only, never certification.
 Return only JSON matching the response schema.
 """
 
+COMBINED_SCAN_PROMPT = """
+You are PokeMarket's single-pass Pokemon trading card scanner. All supplied
+photographs show ONE physical card. Identify the card and perform a conservative
+condition and preliminary authenticity screening in the same response.
+
+Identification:
+- Read the card name, set, collector number, language and variant carefully.
+- Return an exact TCGdex ID only when highly confident.
+- Lower confidence instead of inventing missing details.
+
+Condition:
+- Inspect the complete front and back, all corners, every edge, centering and
+  surface. Look for whitening, scratches, scuffs, dents, bends, creases,
+  indentations, ripples, stains, peeling and print damage.
+- Photographs labelled defect_* are deliberate close-ups and are high-priority
+  evidence that must be reconciled with the wider views.
+- A visible crease, structural bend or indentation prohibits Near Mint and
+  Lightly Played. Severe structural damage should be Heavily Played or Damaged.
+- Never treat "not visible" as "absent". Lower confidence when glare, focus,
+  crop, a sleeve or missing detail prevents inspection.
+
+Authenticity:
+- Do not call an unfamiliar or recent card fake merely because its artwork,
+  wording, set code, year or layout is unfamiliar.
+- Focus on visible discrepancies in typography, borders, symbols, print quality,
+  card back, texture/holo behavior, proportions and reproduction artifacts.
+- If evidence is insufficient, return unable_to_assess. This is preliminary
+  visual screening, never certification.
+
+Confidence values are decimals from 0.0 to 1.0. Return only JSON matching the
+response schema.
+"""
+
 
 class StubProvider:
     name = "stub"
@@ -210,6 +254,11 @@ class StubProvider:
             "warnings": ["AI_PROVIDER is stub."],
         }
 
+    async def analyze(self, images):
+        identification = await self.identify(images)
+        assessment = await self.assess(images, identification, None)
+        return {"identification": identification, **assessment}
+
 
 class GeminiProvider:
     name = "gemini"
@@ -222,23 +271,12 @@ class GeminiProvider:
 
         self.key = settings.gemini_api_key
 
-        # Render can still control the preferred model with GEMINI_MODEL.
-        # Fallback models are retained, but retries are intentionally conservative
-        # so a single scan does not hammer Gemini after a 429.
+        # One preferred model plus one controlled fallback bounds the amount of
+        # image data a failed scan can send. The former six-model rotation could
+        # resend a complete scan many times after a provider outage.
         preferred = settings.gemini_model or "gemini-3.5-flash-lite"
         self.models = []
-
-        # Development/free-tier rotation:
-        # Prefer models with separate quota buckets before falling back to the
-        # newer Flash models that may already have exhausted their daily limits.
-        for model in [
-            preferred,
-            "gemini-3.1-flash-lite",
-            "gemini-3.5-flash",
-            "gemini-3.7-flash",
-            "gemini-3.6-flash",
-            "gemini-3.8-flash",
-        ]:
+        for model in [preferred, "gemini-3.1-flash-lite"]:
             if model not in self.models:
                 self.models.append(model)
 
@@ -395,6 +433,14 @@ class GeminiProvider:
         return await self._generate_json(
             IDENTIFICATION_PROMPT,
             IDENTIFICATION_SCHEMA,
+            images,
+        )
+
+    async def analyze(self, images):
+        """Identify and grade with one image-bearing Gemini request."""
+        return await self._generate_json(
+            COMBINED_SCAN_PROMPT,
+            COMBINED_SCAN_SCHEMA,
             images,
         )
 

@@ -165,6 +165,37 @@ class ListingImageUploadResponse(BaseModel):
     persisted: bool
     images: list[StoredImage]
 
+class DirectUploadItemRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=100)
+    content_type: Literal["image/jpeg", "image/png", "image/webp"]
+    size_bytes: int = Field(gt=0, le=12_000_000)
+
+class DirectUploadSessionRequest(BaseModel):
+    images: list[DirectUploadItemRequest] = Field(min_length=4, max_length=9)
+
+class DirectUploadTarget(BaseModel):
+    label: str
+    object_key: str
+    content_type: str
+    size_bytes: int
+    upload_url: str
+
+class DirectUploadSessionResponse(BaseModel):
+    listing_id: str
+    upload_id: str
+    expires_in: int
+    uploads: list[DirectUploadTarget]
+
+class DirectUploadCompleteItem(BaseModel):
+    label: str = Field(min_length=1, max_length=100)
+    object_key: str = Field(min_length=1, max_length=1000)
+    content_type: Literal["image/jpeg", "image/png", "image/webp"]
+    size_bytes: int = Field(gt=0, le=12_000_000)
+
+class DirectUploadCompleteRequest(BaseModel):
+    upload_id: str = Field(min_length=32, max_length=32)
+    images: list[DirectUploadCompleteItem] = Field(min_length=4, max_length=9)
+
 class ListingUpsertRequest(BaseModel):
     scan_id: str | None = Field(default=None, max_length=64)
     status: Literal["draft", "published", "sold", "archived"] = "draft"
