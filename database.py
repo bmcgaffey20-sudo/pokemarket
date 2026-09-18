@@ -184,6 +184,13 @@ class Order(Base):
     stripe_checkout_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     stripe_payment_intent_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     tracking_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    shipping_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    shipping_line1: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    shipping_line2: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    shipping_city: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    shipping_state: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    shipping_postal_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    shipping_country: Mapped[str | None] = mapped_column(String(2), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     hold_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -238,6 +245,17 @@ class Database:
                 connection.execute(text("ALTER TABLE orders ADD COLUMN stripe_transfer_id VARCHAR(128)"))
             if "stripe_refund_id" not in order_columns:
                 connection.execute(text("ALTER TABLE orders ADD COLUMN stripe_refund_id VARCHAR(128)"))
+            for name, definition in (
+                ("shipping_name", "VARCHAR(160)"),
+                ("shipping_line1", "VARCHAR(200)"),
+                ("shipping_line2", "VARCHAR(200)"),
+                ("shipping_city", "VARCHAR(120)"),
+                ("shipping_state", "VARCHAR(120)"),
+                ("shipping_postal_code", "VARCHAR(32)"),
+                ("shipping_country", "VARCHAR(2)"),
+            ):
+                if name not in order_columns:
+                    connection.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {definition}"))
 
     def ping(self):
         with self.engine.connect() as connection:
@@ -558,20 +576,40 @@ class Database:
             return [self._listing_dict(listing) for listing in listings]
 
     @staticmethod
-    def _order_dict(order):
-        return {
+    def _order_dict(order, listing=None, buyer=None, seller=None):
+        result = {
             "id": order.id, "listing_id": order.listing_id, "buyer_id": order.buyer_id,
             "seller_id": order.seller_id, "status": order.status,
             "item_cents": order.item_cents, "shipping_cents": order.shipping_cents,
             "commission_cents": order.commission_cents, "seller_amount_cents": order.seller_amount_cents,
             "currency": order.currency, "stripe_checkout_session_id": order.stripe_checkout_session_id,
             "stripe_payment_intent_id": order.stripe_payment_intent_id,
-            "tracking_number": order.tracking_number, "delivered_at": order.delivered_at,
+            "tracking_number": order.tracking_number,
+            "shipping_name": order.shipping_name,
+            "shipping_line1": order.shipping_line1,
+            "shipping_line2": order.shipping_line2,
+            "shipping_city": order.shipping_city,
+            "shipping_state": order.shipping_state,
+            "shipping_postal_code": order.shipping_postal_code,
+            "shipping_country": order.shipping_country,
+            "delivered_at": order.delivered_at,
             "hold_until": order.hold_until, "completed_at": order.completed_at,
             "payout_status": order.payout_status, "stripe_transfer_id": order.stripe_transfer_id,
             "stripe_refund_id": order.stripe_refund_id,
             "created_at": order.created_at, "updated_at": order.updated_at,
         }
+        if listing is not None:
+            result.update(
+                listing_title=listing.title,
+                card_name=listing.card_name,
+                set_name=listing.set_name,
+                card_number=listing.card_number,
+            )
+        if buyer is not None:
+            result["buyer_display_name"] = buyer.display_name
+        if seller is not None:
+            result["seller_display_name"] = seller.display_name
+        return result
 
     def create_pending_order(self, order_id, listing_id, buyer_id, commission_percent, shipping_cents=0):
         """Create a checkout attempt without reserving the one-of-one listing."""
@@ -583,7 +621,7 @@ class Database:
                 raise ListingValidationError("You cannot buy your own listing.")
             item_cents = int(listing.price_cents or 0)
             commission_cents = (item_cents * commission_percent + 99) // 100
-            order = Order(id=order_id, listing_id=listing_id, buyer_id=buyer_id, seller_id=listing.seller_id, item_cents=item_cents, shipping_cents=shipping_cents, commission_cents=commission_cents, seller_amount_cents=item_cents - commission_cents, currency=listing.currency)
+            order = Order(id=order_id, listing_id=listing_id, buyer_id=buyer_id, seller_id=listing.seller_id, item_cents=item_cents, shipping_cents=shipping_cents, commission_cents=commission_cents, seller_amount_cents=item_cents + shipping_cents - commission_cents, currency=listing.currency)
             session.add(order)
             session.flush()
             return self._order_dict(order)
@@ -663,6 +701,29 @@ class Database:
             order = session.get(Order, order_id)
             if order is None or user_id not in {order.buyer_id, order.seller_id}:
                 return None
+            return self._order_dict(
+                order,
+                session.get(Listing, order.listing_id),
+                session.get(User, order.buyer_id),
+                session.get(User, order.seller_id),
+            )
+
+    def save_shipping_details(self, session_id, shipping):
+        with self.sessions.begin() as session:
+            order = session.execute(
+                select(Order).where(Order.stripe_checkout_session_id == session_id).with_for_update()
+            ).scalar_one_or_none()
+            if order is None:
+                return None
+            address = shipping.get("address") or {}
+            order.shipping_name = (shipping.get("name") or "").strip() or None
+            order.shipping_line1 = (address.get("line1") or "").strip() or None
+            order.shipping_line2 = (address.get("line2") or "").strip() or None
+            order.shipping_city = (address.get("city") or "").strip() or None
+            order.shipping_state = (address.get("state") or "").strip() or None
+            order.shipping_postal_code = (address.get("postal_code") or "").strip() or None
+            order.shipping_country = (address.get("country") or "").strip().upper()[:2] or None
+            order.updated_at = utc_now()
             return self._order_dict(order)
 
     def confirm_delivery(self, order_id, buyer_id, hold_days):
@@ -684,7 +745,15 @@ class Database:
                 select(Order).where((Order.buyer_id == user_id) | (Order.seller_id == user_id))
                 .order_by(Order.created_at.desc()).limit(limit).offset(offset)
             ).scalars().all()
-            return [self._order_dict(order) for order in orders]
+            return [
+                self._order_dict(
+                    order,
+                    session.get(Listing, order.listing_id),
+                    session.get(User, order.buyer_id),
+                    session.get(User, order.seller_id),
+                )
+                for order in orders
+            ]
 
     def mark_payout(self, order_id, status, transfer_id=None):
         with self.sessions.begin() as session:
@@ -714,7 +783,14 @@ class Database:
             order = session.get(Order, order_id, with_for_update=True)
             if order is None or user_id not in {order.buyer_id, order.seller_id}:
                 return None
-            if order.status != "protection_hold" or not order.hold_until or order.hold_until > utc_now():
+            if order.status == "completed":
+                # Completion is safe to retry so a failed Stripe payout can be
+                # attempted again without incrementing trust counters twice.
+                return self._order_dict(order)
+            hold_until = order.hold_until
+            if hold_until is not None and hold_until.tzinfo is None:
+                hold_until = hold_until.replace(tzinfo=timezone.utc)
+            if order.status != "protection_hold" or not hold_until or hold_until > utc_now():
                 raise ListingValidationError("The 10-day buyer-protection period has not ended.")
             order.status = "completed"
             order.completed_at = utc_now()

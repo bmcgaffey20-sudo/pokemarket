@@ -119,11 +119,11 @@ Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
 After deployment, `/api/v1/health` should include version
-`2.8.3-checkout-return`, `database:"connected"`, `auth:"configured"`, and
+`2.9.0-orders`, `database:"connected"`, `auth:"configured"`, and
 `payments:"configured"` when both Stripe test keys are present.
 
-At startup, SQLAlchemy creates the users table and safely adds `seller_id` to the
-existing listings table. Add Alembic migrations before later production schema
+At startup, SQLAlchemy safely adds the order shipping-address and payout fields
+used by this release. Add Alembic migrations before later production schema
 changes.
 
 Do not upload .pyc files, __pycache__, download, or download (1).

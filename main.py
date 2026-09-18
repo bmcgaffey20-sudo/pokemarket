@@ -65,7 +65,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.8.3-checkout-return")
+app = FastAPI(title=settings.app_name, version="2.9.0-orders")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -211,7 +211,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.8.3-checkout-return",
+        version="2.9.0-orders",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -1052,6 +1052,7 @@ async def create_checkout_session(
             success_url=success_url,
             cancel_url=cancel_url,
             customer_email=current_user["email"],
+            shipping_address_collection={"allowed_countries": ["US"]},
             metadata={"order_id": order_id, "listing_id": payload.listing_id},
             payment_intent_data={"metadata": {"order_id": order_id}},
         )
@@ -1105,6 +1106,11 @@ async def stripe_webhook(
             checkout.get("id"),
             payment_intent_id,
         )
+        if result and result["won"]:
+            collected = checkout.get("collected_information") or {}
+            shipping = checkout.get("shipping_details") or collected.get("shipping_details")
+            if shipping:
+                await asyncio.to_thread(database.save_shipping_details, checkout.get("id"), shipping)
         if result and not result["won"] and not result["already_processed"]:
             order = result["order"]
             if not payment_intent_id:
@@ -1178,7 +1184,7 @@ async def complete_order(order_id: str, current_user=Depends(require_user), data
         raise HTTPException(404, "Order not found.")
     seller = await asyncio.to_thread(database.get_user, order["seller_id"])
     account_id = seller.get("stripe_account_id") if seller else None
-    if account_id and order["seller_amount_cents"] > 0:
+    if account_id and order["seller_amount_cents"] > 0 and order["payout_status"] != "paid":
         try:
             stripe_client = require_stripe()
             transfer = await asyncio.to_thread(
@@ -1187,6 +1193,7 @@ async def complete_order(order_id: str, current_user=Depends(require_user), data
                 currency=order["currency"].lower(),
                 destination=account_id,
                 metadata={"order_id": order["id"], "listing_id": order["listing_id"]},
+                idempotency_key=f"pokemarket-order-payout-{order['id']}",
             )
             order = await asyncio.to_thread(database.mark_payout, order["id"], "paid", transfer["id"])
         except Exception:

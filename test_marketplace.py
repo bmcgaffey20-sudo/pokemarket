@@ -1,7 +1,8 @@
 import pytest
 import main
+from datetime import timedelta
 from fastapi.testclient import TestClient
-from database import Database, Listing
+from database import Database, Listing, Order, utc_now
 from main import app, require_database, require_user
 
 
@@ -126,6 +127,19 @@ def test_stripe_webhook_accepts_raw_json_body(market, monkeypatch):
                         "id": "cs_raw_json",
                         "payment_status": "paid",
                         "payment_intent": "pi_raw_json",
+                        "collected_information": {
+                            "shipping_details": {
+                                "name": "Test Buyer",
+                                "address": {
+                                    "line1": "123 Test Street",
+                                    "line2": "Apt 4",
+                                    "city": "Seattle",
+                                    "state": "WA",
+                                    "postal_code": "98101",
+                                    "country": "US",
+                                },
+                            }
+                        },
                     }
                 },
             }
@@ -143,7 +157,64 @@ def test_stripe_webhook_accepts_raw_json_body(market, monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"received": True}
-    assert db.get_order("order-webhook", "other")["status"] == "paid"
+    saved = db.get_order("order-webhook", "other")
+    assert saved["status"] == "paid"
+    assert saved["shipping_name"] == "Test Buyer"
+    assert saved["shipping_line1"] == "123 Test Street"
+    assert saved["listing_title"] == "Dracozolt VMAX"
+    assert saved["seller_display_name"] == "Seller"
+
+
+def test_order_shipping_delivery_protection_and_completion(market):
+    client, db, _, _ = market
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    order = db.create_pending_order("order-lifecycle", "card", "other", 4, shipping_cents=500)
+    assert order["seller_amount_cents"] == 1250 + 500 - 50
+    db.attach_checkout_session(order["id"], "cs_lifecycle")
+    assert db.claim_order_payment("cs_lifecycle", "pi_lifecycle")["won"] is True
+
+    seller_orders = client.get("/api/v1/orders").json()
+    assert seller_orders[0]["listing_title"] == "Dracozolt VMAX"
+    assert seller_orders[0]["buyer_display_name"] == "Other"
+    shipped = client.post(
+        "/api/v1/orders/order-lifecycle/tracking",
+        json={"tracking_number": "9400111899223856928499"},
+    )
+    assert shipped.status_code == 200
+    assert shipped.json()["status"] == "shipped"
+
+    app.dependency_overrides[require_user] = lambda: db.get_user("other")
+    delivered = client.post("/api/v1/orders/order-lifecycle/confirm-delivery")
+    assert delivered.status_code == 200
+    assert delivered.json()["status"] == "protection_hold"
+    assert client.post("/api/v1/orders/order-lifecycle/complete").status_code == 409
+
+    with db.sessions.begin() as session:
+        stored = session.get(Order, "order-lifecycle")
+        stored.hold_until = utc_now() - timedelta(seconds=1)
+    completed = client.post("/api/v1/orders/order-lifecycle/complete")
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+    assert db.get_user("other")["completed_buys"] == 1
+    assert db.get_user("seller")["successful_sales"] == 1
+    assert db.get_user("seller")["seller_tier"] == 2
+    assert client.post("/api/v1/orders/order-lifecycle/complete").status_code == 200
+    assert db.get_user("other")["completed_buys"] == 1
+    assert db.get_user("seller")["successful_sales"] == 1
+
+
+def test_buyer_cannot_add_tracking(market):
+    client, db, _, _ = market
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    order = db.create_pending_order("order-role", "card", "other", 4)
+    db.attach_checkout_session(order["id"], "cs_role")
+    db.claim_order_payment("cs_role", "pi_role")
+    app.dependency_overrides[require_user] = lambda: db.get_user("other")
+    response = client.post(
+        "/api/v1/orders/order-role/tracking",
+        json={"tracking_number": "NOT-ALLOWED"},
+    )
+    assert response.status_code == 404
 
 
 def test_migration_preserves_drafts_and_requires_explicit_publish(tmp_path):
