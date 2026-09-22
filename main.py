@@ -214,7 +214,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.9.0-orders",
+        version="2.10.0-bandwidth-optimized",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
