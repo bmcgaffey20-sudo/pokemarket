@@ -1,7 +1,10 @@
+import asyncio
 import pytest
 import main
 from datetime import timedelta
+from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
+from auth import create_access_token
 from database import Database, Listing, Order, utc_now
 from main import app, require_database, require_user
 
@@ -215,6 +218,67 @@ def test_buyer_cannot_add_tracking(market):
         json={"tracking_number": "NOT-ALLOWED"},
     )
     assert response.status_code == 404
+
+
+def test_return_lifecycle_holds_payout_refunds_and_restores_draft(market):
+    client, db, _, _ = market
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    order = db.create_pending_order("order-return", "card", "other", 4)
+    db.attach_checkout_session(order["id"], "cs_return")
+    assert db.claim_order_payment("cs_return", "pi_return")["won"] is True
+    db.set_tracking(order["id"], "seller", "OUTBOUND-TRACKING")
+    delivered = db.confirm_delivery(order["id"], "other", 10)
+    assert delivered["status"] == "protection_hold"
+
+    requested = db.request_return(order["id"], "other", "not_as_described", "Condition mismatch")
+    assert requested["status"] == "return_requested"
+    assert requested["payout_status"] == "on_hold"
+    assert db.review_return(order["id"], "seller", True)["status"] == "return_approved"
+    assert db.set_return_tracking(order["id"], "other", "RETURN-TRACKING")["status"] == "return_shipped"
+    assert db.begin_return_refund(order["id"], "seller")["status"] == "refund_pending"
+    refunded = db.mark_order_refunded(order["id"], "re_return")
+    assert refunded["status"] == "refunded"
+    assert refunded["payout_status"] == "not_applicable"
+    assert db.get_listing("card", "seller")["status"] == "draft"
+
+
+def test_admin_can_list_users_and_override_seller_tier(market):
+    _, db, _, _ = market
+    admin = db.set_admin("seller", True)
+    assert admin["is_admin"] is True
+    users = db.list_users(query="other@example")
+    assert [user["id"] for user in users] == ["other"]
+    updated = db.set_seller_tier("other", 4)
+    assert updated["seller_tier"] == 4
+    assert updated["max_listing_cents"] == 25_000
+
+
+def test_admin_access_tracks_admin_emails_source_of_truth(market, monkeypatch):
+    _, db, _, _ = market
+    secret = "test-admin-secret-that-is-long-enough"
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer",
+        credentials=create_access_token("seller", secret, 3600),
+    )
+    monkeypatch.setattr(main.settings, "auth_secret", secret)
+
+    monkeypatch.setattr(main.settings, "admin_emails", "seller@example.com")
+    promoted = asyncio.run(require_user(credentials=credentials, database=db))
+    assert promoted["is_admin"] is True
+
+    monkeypatch.setattr(main.settings, "admin_emails", "")
+    removed = asyncio.run(require_user(credentials=credentials, database=db))
+    assert removed["is_admin"] is False
+
+
+def test_scan_job_can_be_delayed_for_gemini_capacity(market):
+    _, db, _, _ = market
+    job = db.create_scan_job("scan-retry-job", "card", "seller")
+    claimed = db.claim_next_scan_job()
+    assert claimed["attempts"] == 1
+    queued = db.requeue_scan_job(job["job_id"], 15, "Gemini busy")
+    assert queued["status"] == "queued"
+    assert queued["next_attempt_at"] is not None
 
 
 def test_migration_preserves_drafts_and_requires_explicit_publish(tmp_path):

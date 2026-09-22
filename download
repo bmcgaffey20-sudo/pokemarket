@@ -1,2 +1,8 @@
-# Created by pytest automatically.
-*
+.env
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+venv/
+download
+download (1)

@@ -18,7 +18,7 @@ try:
 except ImportError:  # Tests can run without payment SDK installed.
     stripe = None
 
-from ai import get_ai_provider, new_scan_id
+from ai import GeminiUnavailableError, get_ai_provider, new_scan_id
 from auth import (
     AuthConfigurationError,
     InvalidTokenError,
@@ -60,7 +60,13 @@ from schemas import (
     ScanJobRequest,
     ScanJobAccepted,
     ScanJobStatus,
+    ReturnRequest,
+    ReturnReviewRequest,
+    SellerTierUpdateRequest,
+    DeviceTokenRequest,
+    DeviceTokenResponse,
 )
+from notifications import send_push
 from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
 from recovery import install_recovery, limit_auth, send_action_email
@@ -72,7 +78,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.12.1-legacy-delete")
+app = FastAPI(title=settings.app_name, version="2.13.0-beta-control")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -150,7 +156,19 @@ async def require_user(
         raise HTTPException(401, "Account no longer exists.", headers={"WWW-Authenticate": "Bearer"})
     if payload.get("ver", 0) != user["session_version"]:
         raise HTTPException(401, "Your session was invalidated. Sign in again.", headers={"WWW-Authenticate": "Bearer"})
+    # ADMIN_EMAILS is the source of truth. Synchronizing both promotion and
+    # removal prevents an account from retaining administrator access after it
+    # is removed from the Render environment variable.
+    should_be_admin = user["email"].lower() in settings.admin_email_list
+    if bool(user.get("is_admin")) != should_be_admin:
+        user = await asyncio.to_thread(database.set_admin, user["id"], should_be_admin)
     return user
+
+
+async def require_admin(current_user=Depends(require_user)):
+    if not current_user.get("is_admin"):
+        raise HTTPException(403, "Administrator access is required.")
+    return current_user
 
 
 def auth_response(user, legacy_listings_claimed=0):
@@ -223,11 +241,12 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.12.1-legacy-delete",
+        version="2.13.0-beta-control",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
         email="configured" if settings.email_configured else "not_configured",
+        push_notifications="configured" if settings.firebase_configured else "not_configured",
         payments="configured" if settings.stripe_configured and stripe is not None else "not_configured",
     )
 
@@ -291,6 +310,9 @@ async def login(payload: LoginRequest, request: Request, database=Depends(requir
     if not valid:
         raise HTTPException(401, "Email or password is incorrect.")
     await asyncio.to_thread(database.record_login, user["id"])
+    should_be_admin = user["email"].lower() in settings.admin_email_list
+    if bool(user.get("is_admin")) != should_be_admin:
+        user = await asyncio.to_thread(database.set_admin, user["id"], should_be_admin)
     public_user = {
         key: user[key]
         for key in (
@@ -305,6 +327,7 @@ async def login(payload: LoginRequest, request: Request, database=Depends(requir
             "successful_sales",
             "successful_sales_over_100",
             "max_listing_cents",
+            "is_admin",
         )
     }
     return auth_response(public_user)
@@ -313,6 +336,61 @@ async def login(payload: LoginRequest, request: Request, database=Depends(requir
 @app.get("/api/v1/auth/me", response_model=UserResponse)
 async def read_current_user(current_user=Depends(require_user)):
     return UserResponse(**(await user_with_stripe_status(current_user)))
+
+
+@app.post("/api/v1/notifications/devices", response_model=DeviceTokenResponse)
+async def register_notification_device(
+    payload: DeviceTokenRequest,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
+    return await asyncio.to_thread(
+        database.register_device_token,
+        current_user["id"],
+        payload.token,
+        payload.platform,
+    )
+
+
+@app.get("/api/v1/admin/users", response_model=list[UserResponse])
+async def admin_users(
+    limit: int = 100,
+    offset: int = 0,
+    q: str = "",
+    _admin=Depends(require_admin),
+    database=Depends(require_database),
+):
+    if not 1 <= limit <= 200 or offset < 0:
+        raise HTTPException(400, "Invalid pagination.")
+    return await asyncio.to_thread(database.list_users, limit, offset, q[:200])
+
+
+@app.patch("/api/v1/admin/users/{user_id}/seller-tier", response_model=UserResponse)
+async def admin_set_seller_tier(
+    user_id: str,
+    payload: SellerTierUpdateRequest,
+    background: BackgroundTasks,
+    _admin=Depends(require_admin),
+    database=Depends(require_database),
+):
+    user = await asyncio.to_thread(database.set_seller_tier, user_id, payload.seller_tier)
+    if user is None:
+        raise HTTPException(404, "User not found.")
+    background.add_task(
+        send_push,
+        settings,
+        database,
+        [user_id],
+        "Seller level updated",
+        f"Your PokeMarket seller level is now Tier {payload.seller_tier}.",
+        {"page": "account"},
+    )
+    return user
+
+
+@app.get("/api/v1/admin/returns", response_model=list[OrderResponse])
+async def admin_return_disputes(_admin=Depends(require_admin), database=Depends(require_database)):
+    return await asyncio.to_thread(database.list_return_disputes)
 
 
 install_recovery(app, settings, require_database, require_user)
@@ -503,6 +581,11 @@ async def perform_scan_analysis(
         # second Base64 copy of every photograph leaving Render.
         combined = await provider.analyze(images)
 
+    except GeminiUnavailableError:
+        # The durable worker handles capacity retry scheduling. Keep this typed
+        # exception intact instead of flattening it into a generic HTTP error.
+        raise
+
     except ValueError as exc:
         logger.error(
             "AI configuration/value error during identification: %s: %s",
@@ -610,11 +693,14 @@ async def analyze_scan(
 ):
     """Compatibility endpoint for older Android builds."""
     images = await read_images(files)
-    return await perform_scan_analysis(
-        images,
-        include_condition=include_condition,
-        include_authenticity=include_authenticity,
-    )
+    try:
+        return await perform_scan_analysis(
+            images,
+            include_condition=include_condition,
+            include_authenticity=include_authenticity,
+        )
+    except GeminiUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
 
 
 def get_r2_storage():
@@ -667,6 +753,24 @@ async def scan_worker_loop():
             )
         except asyncio.CancelledError:
             raise
+        except GeminiUnavailableError as exc:
+            logger.warning("Gemini capacity delay for scan job %s: %s", job and job.get("job_id"), exc.details)
+            if job and job["attempts"] < settings.gemini_job_max_attempts:
+                delay = settings.gemini_retry_base_seconds * (2 ** (job["attempts"] - 1))
+                await asyncio.to_thread(
+                    database.requeue_scan_job,
+                    job["job_id"],
+                    delay,
+                    str(exc),
+                )
+            elif job:
+                await asyncio.to_thread(
+                    database.finish_scan_job,
+                    job["job_id"],
+                    None,
+                    "Gemini remained busy after automatic retries. Your photos are saved; start the analysis again shortly.",
+                )
+            await asyncio.sleep(settings.scan_worker_poll_seconds)
         except Exception as exc:
             logger.exception("Background scan job failed")
             if "job" in locals() and job:
@@ -1339,6 +1443,7 @@ async def create_checkout_session(
 @app.post("/api/v1/payments/webhook")
 async def stripe_webhook(
     request: Request,
+    background: BackgroundTasks,
     stripe_signature: str | None = Header(default=None, alias="Stripe-Signature"),
     database=Depends(require_database),
 ):
@@ -1372,6 +1477,8 @@ async def stripe_webhook(
             shipping = checkout.get("shipping_details") or collected.get("shipping_details")
             if shipping:
                 await asyncio.to_thread(database.save_shipping_details, checkout.get("id"), shipping)
+            order = result["order"]
+            background.add_task(send_push, settings, database, [order["seller_id"]], "Card sold", "You received a new PokeMarket order.", {"page": "orders", "order_id": order["id"]})
         if result and not result["won"] and not result["already_processed"]:
             order = result["order"]
             if not payment_intent_id:
@@ -1414,29 +1521,107 @@ async def read_order(order_id: str, current_user=Depends(require_user), database
 
 
 @app.post("/api/v1/orders/{order_id}/tracking", response_model=OrderResponse)
-async def add_order_tracking(order_id: str, payload: TrackingRequest, current_user=Depends(require_user), database=Depends(require_database)):
+async def add_order_tracking(order_id: str, payload: TrackingRequest, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
     try:
         order = await asyncio.to_thread(database.set_tracking, order_id, current_user["id"], payload.tracking_number.strip())
     except ListingValidationError as exc:
         raise HTTPException(409, str(exc)) from exc
     if order is None:
         raise HTTPException(404, "Order not found.")
+    background.add_task(send_push, settings, database, [order["buyer_id"]], "Your card has shipped", "The seller added tracking to your PokeMarket order.", {"page": "orders", "order_id": order_id})
     return order
 
 
 @app.post("/api/v1/orders/{order_id}/confirm-delivery", response_model=OrderResponse)
-async def confirm_order_delivery(order_id: str, current_user=Depends(require_user), database=Depends(require_database)):
+async def confirm_order_delivery(order_id: str, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
     try:
         order = await asyncio.to_thread(database.confirm_delivery, order_id, current_user["id"], settings.seller_hold_days)
     except ListingValidationError as exc:
         raise HTTPException(409, str(exc)) from exc
     if order is None:
         raise HTTPException(404, "Order not found.")
+    background.add_task(send_push, settings, database, [order["seller_id"]], "Delivery confirmed", "Buyer protection has started for your sale.", {"page": "orders", "order_id": order_id})
+    return order
+
+
+@app.post("/api/v1/orders/{order_id}/returns", response_model=OrderResponse)
+async def request_order_return(order_id: str, payload: ReturnRequest, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
+    try:
+        order = await asyncio.to_thread(database.request_return, order_id, current_user["id"], payload.reason, payload.notes)
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if order is None:
+        raise HTTPException(404, "Order not found.")
+    background.add_task(send_push, settings, database, [order["seller_id"]], "Return requested", "A buyer requested a return. Review it in Orders.", {"page": "orders", "order_id": order_id})
+    return order
+
+
+@app.post("/api/v1/orders/{order_id}/returns/review", response_model=OrderResponse)
+async def review_order_return(order_id: str, payload: ReturnReviewRequest, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
+    try:
+        order = await asyncio.to_thread(database.review_return, order_id, current_user["id"], payload.approved)
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if order is None:
+        raise HTTPException(404, "Order not found.")
+    title = "Return approved" if payload.approved else "Return escalated"
+    body = "Add return tracking in Orders." if payload.approved else "The return needs administrator review."
+    background.add_task(send_push, settings, database, [order["buyer_id"]], title, body, {"page": "orders", "order_id": order_id})
+    return order
+
+
+@app.post("/api/v1/orders/{order_id}/returns/tracking", response_model=OrderResponse)
+async def add_return_tracking(order_id: str, payload: TrackingRequest, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
+    try:
+        order = await asyncio.to_thread(database.set_return_tracking, order_id, current_user["id"], payload.tracking_number.strip())
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if order is None:
+        raise HTTPException(404, "Order not found.")
+    background.add_task(send_push, settings, database, [order["seller_id"]], "Return shipped", "The buyer added return tracking.", {"page": "orders", "order_id": order_id})
+    return order
+
+
+@app.post("/api/v1/orders/{order_id}/returns/received", response_model=OrderResponse)
+async def confirm_return_received(order_id: str, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
+    try:
+        order = await asyncio.to_thread(database.begin_return_refund, order_id, current_user["id"])
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if order is None:
+        raise HTTPException(404, "Order not found.")
+    if not order.get("stripe_payment_intent_id"):
+        raise HTTPException(409, "This order has no Stripe payment to refund.")
+    try:
+        stripe_client = require_stripe()
+        refund = await asyncio.to_thread(
+            stripe_client.Refund.create,
+            payment_intent=order["stripe_payment_intent_id"],
+            metadata={"order_id": order_id, "reason": "approved_return"},
+            idempotency_key=f"pokemarket-return-{order_id}",
+        )
+        order = await asyncio.to_thread(database.mark_order_refunded, order_id, refund["id"])
+    except Exception as exc:
+        logger.exception("Return refund failed for order %s", order_id)
+        raise HTTPException(502, "Stripe refund is pending. Tap confirm again shortly.") from exc
+    background.add_task(send_push, settings, database, [order["buyer_id"], order["seller_id"]], "Return refunded", "The return is complete and the refund was issued.", {"page": "orders", "order_id": order_id})
+    return order
+
+
+@app.post("/api/v1/admin/orders/{order_id}/returns/resolve", response_model=OrderResponse)
+async def admin_resolve_return(order_id: str, payload: ReturnReviewRequest, background: BackgroundTasks, _admin=Depends(require_admin), database=Depends(require_database)):
+    try:
+        order = await asyncio.to_thread(database.resolve_return_dispute, order_id, payload.approved)
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if order is None:
+        raise HTTPException(404, "Order not found.")
+    background.add_task(send_push, settings, database, [order["buyer_id"], order["seller_id"]], "Return dispute updated", "An administrator resolved the return review.", {"page": "orders", "order_id": order_id})
     return order
 
 
 @app.post("/api/v1/orders/{order_id}/complete", response_model=OrderResponse)
-async def complete_order(order_id: str, current_user=Depends(require_user), database=Depends(require_database)):
+async def complete_order(order_id: str, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
     try:
         order = await asyncio.to_thread(database.complete_order, order_id, current_user["id"])
     except ListingValidationError as exc:
@@ -1460,4 +1645,5 @@ async def complete_order(order_id: str, current_user=Depends(require_user), data
         except Exception:
             logger.exception("Seller payout failed for order %s", order_id)
             order = await asyncio.to_thread(database.mark_payout, order["id"], "failed")
+    background.add_task(send_push, settings, database, [order["buyer_id"], order["seller_id"]], "Order completed", "The PokeMarket order is complete.", {"page": "orders", "order_id": order_id})
     return order

@@ -94,6 +94,7 @@ class User(Base):
     successful_sales_over_100: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     max_listing_cents: Mapped[int | None] = mapped_column(Integer, default=8_000, nullable=True)
     stripe_account_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
 
 class AccountAction(Base):
@@ -197,6 +198,12 @@ class Order(Base):
     payout_status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
     stripe_transfer_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     stripe_refund_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    return_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    return_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    return_tracking_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    return_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
@@ -213,7 +220,19 @@ class ScanJob(Base):
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class DeviceToken(Base):
+    __tablename__ = "device_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    platform: Mapped[str] = mapped_column(String(16), default="android", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
 
@@ -237,7 +256,11 @@ class Database:
         Base.metadata.create_all(self.engine)
         user_columns = {column["name"] for column in inspect(self.engine).get_columns("users")}
         with self.engine.begin() as connection:
-            for name, definition in (("email_verified", "BOOLEAN NOT NULL DEFAULT false"), ("session_version", "INTEGER NOT NULL DEFAULT 0")):
+            for name, definition in (
+                ("email_verified", "BOOLEAN NOT NULL DEFAULT false"),
+                ("session_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("is_admin", "BOOLEAN NOT NULL DEFAULT false"),
+            ):
                 if name not in user_columns:
                     connection.execute(text(f"ALTER TABLE users ADD COLUMN {name} {definition}"))
         # create_all is intentionally non-destructive and does not add columns to
@@ -274,9 +297,23 @@ class Database:
                 ("shipping_state", "VARCHAR(120)"),
                 ("shipping_postal_code", "VARCHAR(32)"),
                 ("shipping_country", "VARCHAR(2)"),
+                ("return_reason", "VARCHAR(64)"),
+                ("return_notes", "TEXT"),
+                ("return_tracking_number", "VARCHAR(128)"),
+                ("return_requested_at", "TIMESTAMP"),
+                ("return_approved_at", "TIMESTAMP"),
+                ("return_received_at", "TIMESTAMP"),
             ):
                 if name not in order_columns:
                     connection.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {definition}"))
+        scan_columns = {column["name"] for column in inspect(self.engine).get_columns("scan_jobs")}
+        if "next_attempt_at" not in scan_columns:
+            with self.engine.begin() as connection:
+                connection.execute(text("ALTER TABLE scan_jobs ADD COLUMN next_attempt_at TIMESTAMP"))
+        with self.engine.begin() as connection:
+            connection.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_scan_jobs_next_attempt_at ON scan_jobs (next_attempt_at)")
+            )
 
     def ping(self):
         with self.engine.connect() as connection:
@@ -298,6 +335,7 @@ class Database:
             "max_listing_cents": user.max_listing_cents,
             "stripe_account_id": user.stripe_account_id,
             "stripe_connected": bool(user.stripe_account_id),
+            "is_admin": user.is_admin,
         }
 
     @staticmethod
@@ -390,6 +428,69 @@ class Database:
         with self.sessions() as session:
             user = session.get(User, user_id)
             return self._user_dict(user) if user else None
+
+    def set_admin(self, user_id, enabled=True):
+        with self.sessions.begin() as session:
+            user = session.get(User, user_id, with_for_update=True)
+            if user is None:
+                return None
+            user.is_admin = bool(enabled)
+            return self._user_dict(user)
+
+    def list_users(self, limit=100, offset=0, query=""):
+        with self.sessions() as session:
+            statement = select(User)
+            if query.strip():
+                term = f"%{query.strip().lower()}%"
+                statement = statement.where(
+                    User.email.ilike(term) | User.display_name.ilike(term)
+                )
+            users = session.execute(
+                statement.order_by(User.created_at.desc()).limit(limit).offset(offset)
+            ).scalars().all()
+            return [self._user_dict(user) for user in users]
+
+    def set_seller_tier(self, user_id, tier):
+        limits = {1: 8_000, 2: 10_000, 3: 20_000, 4: 25_000, 5: 100_000}
+        if tier not in limits:
+            raise ListingValidationError("Seller tier must be between 1 and 5.")
+        with self.sessions.begin() as session:
+            user = session.get(User, user_id, with_for_update=True)
+            if user is None:
+                return None
+            user.seller_tier = tier
+            user.max_listing_cents = limits[tier]
+            return self._user_dict(user)
+
+    def register_device_token(self, user_id, token, platform="android"):
+        with self.sessions.begin() as session:
+            record = session.execute(
+                select(DeviceToken).where(DeviceToken.token == token)
+            ).scalar_one_or_none()
+            if record is None:
+                record = DeviceToken(user_id=user_id, token=token, platform=platform)
+                session.add(record)
+            else:
+                record.user_id = user_id
+                record.platform = platform
+                record.updated_at = utc_now()
+            session.flush()
+            return {"status": "registered"}
+
+    def device_tokens_for_users(self, user_ids):
+        ids = list(set(user_ids))
+        if not ids:
+            return []
+        with self.sessions() as session:
+            return [
+                row[0] for row in session.execute(
+                    select(DeviceToken.token).where(DeviceToken.user_id.in_(ids))
+                ).all()
+            ]
+
+    def delete_device_token(self, token):
+        with self.sessions.begin() as session:
+            return session.execute(delete(DeviceToken).where(DeviceToken.token == token)).rowcount
 
     def set_stripe_account(self, user_id, account_id):
         with self.sessions.begin() as session:
@@ -632,6 +733,7 @@ class Database:
             "result": job.result,
             "error": job.error,
             "attempts": job.attempts,
+            "next_attempt_at": job.next_attempt_at,
             "created_at": job.created_at,
             "updated_at": job.updated_at,
         }
@@ -666,7 +768,10 @@ class Database:
 
     def claim_next_scan_job(self):
         with self.sessions.begin() as session:
-            statement = select(ScanJob).where(ScanJob.status == "queued").order_by(ScanJob.created_at).limit(1)
+            statement = select(ScanJob).where(
+                ScanJob.status == "queued",
+                (ScanJob.next_attempt_at.is_(None)) | (ScanJob.next_attempt_at <= utc_now()),
+            ).order_by(ScanJob.created_at).limit(1)
             if self.engine.dialect.name == "postgresql":
                 statement = statement.with_for_update(skip_locked=True)
             job = session.execute(statement).scalar_one_or_none()
@@ -674,8 +779,20 @@ class Database:
                 return None
             job.status = "processing"
             job.attempts += 1
+            job.next_attempt_at = None
             job.updated_at = utc_now()
             session.flush()
+            return self._scan_job_dict(job)
+
+    def requeue_scan_job(self, job_id, delay_seconds, error):
+        with self.sessions.begin() as session:
+            job = session.get(ScanJob, job_id, with_for_update=True)
+            if job is None:
+                return None
+            job.status = "queued"
+            job.error = error
+            job.next_attempt_at = utc_now() + timedelta(seconds=max(1, int(delay_seconds)))
+            job.updated_at = utc_now()
             return self._scan_job_dict(job)
 
     def finish_scan_job(self, job_id, result=None, error=None):
@@ -686,6 +803,7 @@ class Database:
             job.status = "complete" if error is None else "failed"
             job.result = result if error is None else None
             job.error = error
+            job.next_attempt_at = None
             job.updated_at = utc_now()
             return self._scan_job_dict(job)
 
@@ -799,6 +917,12 @@ class Database:
             "hold_until": order.hold_until, "completed_at": order.completed_at,
             "payout_status": order.payout_status, "stripe_transfer_id": order.stripe_transfer_id,
             "stripe_refund_id": order.stripe_refund_id,
+            "return_reason": order.return_reason,
+            "return_notes": order.return_notes,
+            "return_tracking_number": order.return_tracking_number,
+            "return_requested_at": order.return_requested_at,
+            "return_approved_at": order.return_approved_at,
+            "return_received_at": order.return_received_at,
             "created_at": order.created_at, "updated_at": order.updated_at,
         }
         if listing is not None:
@@ -891,7 +1015,14 @@ class Database:
             if order.status == "refund_pending":
                 order.status = "refunded"
                 order.stripe_refund_id = refund_id
+                order.payout_status = "not_applicable"
                 order.updated_at = utc_now()
+                if order.return_reason:
+                    listing = session.get(Listing, order.listing_id, with_for_update=True)
+                    if listing is not None:
+                        listing.status = "draft"
+                        listing.publication_approved = False
+                        listing.updated_at = utc_now()
             return self._order_dict(order)
 
     def mark_order_paid(self, session_id, payment_intent_id=None):
@@ -980,6 +1111,93 @@ class Database:
             order.status = "shipped"
             order.updated_at = utc_now()
             return self._order_dict(order)
+
+    def request_return(self, order_id, buyer_id, reason, notes=""):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None or order.buyer_id != buyer_id:
+                return None
+            hold_until = order.hold_until
+            if hold_until is not None and hold_until.tzinfo is None:
+                hold_until = hold_until.replace(tzinfo=timezone.utc)
+            if order.status != "protection_hold" or not hold_until or hold_until < utc_now():
+                raise ListingValidationError("Returns must be requested during the buyer-protection period.")
+            order.status = "return_requested"
+            order.return_reason = reason
+            order.return_notes = notes.strip() or None
+            order.return_requested_at = utc_now()
+            order.payout_status = "on_hold"
+            order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def review_return(self, order_id, seller_id, approved):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None or order.seller_id != seller_id:
+                return None
+            if order.status != "return_requested":
+                raise ListingValidationError("This return is no longer awaiting seller review.")
+            order.status = "return_approved" if approved else "return_disputed"
+            if approved:
+                order.return_approved_at = utc_now()
+            order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def set_return_tracking(self, order_id, buyer_id, tracking_number):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None or order.buyer_id != buyer_id:
+                return None
+            if order.status not in {"return_approved", "return_shipped"}:
+                raise ListingValidationError("This return is not ready for return shipping.")
+            order.return_tracking_number = tracking_number
+            order.status = "return_shipped"
+            order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def begin_return_refund(self, order_id, seller_id):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None or order.seller_id != seller_id:
+                return None
+            if order.status not in {"return_shipped", "refund_pending"}:
+                raise ListingValidationError("The returned card must be shipped before confirming receipt.")
+            if order.status == "return_shipped":
+                order.status = "refund_pending"
+                order.return_received_at = utc_now()
+                order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def resolve_return_dispute(self, order_id, approved):
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None:
+                return None
+            if order.status != "return_disputed":
+                raise ListingValidationError("This order does not have an open return dispute.")
+            if approved:
+                order.status = "return_approved"
+                order.return_approved_at = utc_now()
+            else:
+                order.status = "protection_hold"
+                order.payout_status = "pending"
+            order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def list_return_disputes(self):
+        with self.sessions() as session:
+            orders = session.execute(
+                select(Order).where(Order.status == "return_disputed").order_by(Order.updated_at)
+            ).scalars().all()
+            return [
+                self._order_dict(
+                    order,
+                    session.get(Listing, order.listing_id),
+                    session.get(User, order.buyer_id),
+                    session.get(User, order.seller_id),
+                )
+                for order in orders
+            ]
 
     def complete_order(self, order_id, user_id):
         with self.sessions.begin() as session:

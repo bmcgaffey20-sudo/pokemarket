@@ -274,9 +274,12 @@ class GeminiProvider:
         # One preferred model plus one controlled fallback bounds the amount of
         # image data a failed scan can send. The former six-model rotation could
         # resend a complete scan many times after a provider outage.
-        preferred = settings.gemini_model or "gemini-3.5-flash-lite"
+        preferred = settings.gemini_model or "gemini-3.1-flash-lite"
         self.models = []
-        for model in [preferred, "gemini-3.1-flash-lite"]:
+        configured_fallbacks = [
+            model.strip() for model in settings.gemini_fallback_models.split(",") if model.strip()
+        ]
+        for model in [preferred, *configured_fallbacks, "gemini-3.1-flash-lite"]:
             if model not in self.models:
                 self.models.append(model)
 
@@ -424,9 +427,9 @@ class GeminiProvider:
                         await asyncio.sleep(2.0 + random.uniform(0.2, 0.8))
                         continue
 
-        raise RuntimeError(
-            "All Gemini models/retries failed. "
-            + " | ".join(errors[-8:])
+        raise GeminiUnavailableError(
+            "Gemini is temporarily busy. PokeMarket will retry this saved scan automatically.",
+            details=" | ".join(errors[-8:]),
         )
 
     async def identify(self, images):
@@ -501,6 +504,12 @@ class TransientGeminiError(Exception):
             f"{model} returned transient HTTP {status_code}"
             f"{retry_text}: {body}"
         )
+
+
+class GeminiUnavailableError(RuntimeError):
+    def __init__(self, message, details=""):
+        self.details = details
+        super().__init__(message)
 
 
 def get_ai_provider(settings):

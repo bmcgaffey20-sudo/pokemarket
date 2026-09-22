@@ -15,6 +15,7 @@ class HealthResponse(BaseModel):
     auth: str
     email: str = "not_configured"
     payments: str = "not_configured"
+    push_notifications: str = "not_configured"
 
 class RegisterRequest(BaseModel):
     email: str = Field(min_length=5, max_length=254)
@@ -63,6 +64,7 @@ class UserResponse(BaseModel):
     stripe_charges_enabled: bool = False
     stripe_payouts_enabled: bool = False
     stripe_requirements_due: list[str] = Field(default_factory=list)
+    is_admin: bool = False
 
 class CheckoutRequest(BaseModel):
     listing_id: str = Field(min_length=1, max_length=64)
@@ -113,11 +115,34 @@ class OrderResponse(BaseModel):
     payout_status: str = "pending"
     stripe_transfer_id: str | None = None
     stripe_refund_id: str | None = None
+    return_reason: str | None = None
+    return_notes: str | None = None
+    return_tracking_number: str | None = None
+    return_requested_at: datetime | None = None
+    return_approved_at: datetime | None = None
+    return_received_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
 class TrackingRequest(BaseModel):
     tracking_number: str = Field(min_length=3, max_length=128)
+
+class ReturnRequest(BaseModel):
+    reason: Literal["not_as_described", "damaged_in_transit", "authenticity_concern", "wrong_card", "other"]
+    notes: str = Field(default="", max_length=2000)
+
+class ReturnReviewRequest(BaseModel):
+    approved: bool
+
+class SellerTierUpdateRequest(BaseModel):
+    seller_tier: int = Field(ge=1, le=5)
+
+class DeviceTokenRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=4096)
+    platform: Literal["android"] = "android"
+
+class DeviceTokenResponse(BaseModel):
+    status: Literal["registered"]
 
 class CheckoutProviderResponse(BaseModel):
     url: str
@@ -166,6 +191,8 @@ class ScanJobStatus(BaseModel):
     status: Literal["queued", "processing", "complete", "failed"]
     result: ScanAnalysisResponse | None = None
     error: str | None = None
+    attempts: int = 0
+    next_attempt_at: datetime | None = None
 
 class StoredImage(BaseModel):
     label: str

@@ -1,7 +1,8 @@
-# PokeMarket Backend 2.12.1 — legacy deletion compatibility
+# PokeMarket Backend 2.13.0 — beta control center
 
-Read UPDATE-2.7.1.md first for Mailjet setup, deployment and recovery testing.
-UPDATE-2.6.0.md documents publishing and public-photo behavior.
+Read `UPDATE-2.13.0.md` for this release's deployment notes. The older update
+files remain as a history of the account, publishing, cloud-photo, and deletion
+changes that are already included here.
 
 Adds labelled defect close-ups, strict condition inspection, explicit major-defect
 reporting, confidence normalization, and a server-side safeguard that prevents a
@@ -40,6 +41,7 @@ The service creates the application tables on first connection, including:
 - `orders`: buyer, seller, listing, Stripe payment state, 4% marketplace
   commission, delivery-protection hold, and seller payout state.
 - `scan_jobs`: durable queued/processing/completed AI scan state and results.
+- `device_tokens`: account-owned Android Firebase notification tokens.
 
 Originals use versioned private keys such as:
 
@@ -80,16 +82,23 @@ Checkout and orders:
 - Sellers can add tracking; buyers confirm delivery; completion is blocked
   until the 10-day protection hold ends. Only then is the seller transfer
   created and the seller's trust-tier counters updated.
+- Buyers can request a return during the protection window. Approval, return
+  tracking, receipt confirmation, Stripe refund, dispute escalation, and
+  automatic restoration of the returned card to a private draft are included.
+- Firebase notifications cover sales, shipping, delivery, returns, refunds,
+  completed orders, and administrator seller-tier changes.
+- Administrators can list users, manually set seller tiers, and resolve return
+  disputes. Access is restricted to accounts listed in `ADMIN_EMAILS`.
+- Gemini capacity errors are retried by the durable worker with exponential
+  delays, while the original R2 photos remain safely stored.
 
-This version is intentionally flat. Upload every extracted file directly into
-your existing GitHub folder:
+This version is intentionally flat. Upload the extracted files directly to the
+root of your existing backend GitHub repository. There is no `app/` folder in
+the backend package.
 
-PokeMarket-backend-v0.1/
-
-There is no app/ folder in this version.
-
-Render Root Directory:
-PokeMarket-backend-v0.1
+Render Root Directory: leave blank when these files are at the repository root.
+If your repository intentionally keeps the backend in a subfolder, enter that
+subfolder name instead.
 
 Render Build Command:
 pip install -r requirements.txt
@@ -115,6 +124,9 @@ R2_SECRET_ACCESS_KEY=<your Cloudflare secret access key>
 STRIPE_SECRET_KEY=sk_test_<your Stripe test secret>
 STRIPE_PUBLISHABLE_KEY=pk_test_<your Stripe test publishable key>
 STRIPE_WEBHOOK_SECRET=whsec_<your Stripe test webhook signing secret>
+ADMIN_EMAILS=<your signed-in PokeMarket email>
+FIREBASE_PROJECT_ID=<your Firebase project ID>
+FIREBASE_SERVICE_ACCOUNT_JSON=<single-line Firebase service-account JSON>
 
 Generate `AUTH_SECRET` and `LEGACY_CLAIM_CODE` separately on Windows with:
 
@@ -124,11 +136,13 @@ Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
 After deployment, `/api/v1/health` should include version
-`2.12.1-legacy-delete`, `database:"connected"`, `auth:"configured"`, and
-`payments:"configured"` when both Stripe test keys are present.
+`2.13.0-beta-control`, `database:"connected"`, `auth:"configured"`,
+`payments:"configured"`, and `push_notifications:"configured"` when Firebase
+is configured.
 
 At startup, SQLAlchemy safely adds the order shipping-address and payout fields
-used by this release. Add Alembic migrations before later production schema
-changes.
+used by this release, the return fields, administrator flag, notification-token
+table, and Gemini retry timestamp. Add Alembic migrations before later
+production schema changes.
 
 Do not upload .pyc files, __pycache__, download, or download (1).

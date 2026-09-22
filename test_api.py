@@ -3,6 +3,7 @@ import re
 import sqlite3
 import uuid
 import pytest
+from sqlalchemy import inspect
 
 from fastapi.testclient import TestClient
 from auth import create_access_token, decode_access_token, hash_password, verify_password
@@ -15,7 +16,7 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.12.1-legacy-delete"
+    assert r.json()["version"] == "2.13.0-beta-control"
     assert r.json()["database"] in {"not_configured", "connected"}
     assert r.json()["auth"] in {"not_configured", "configured"}
 
@@ -201,6 +202,28 @@ def test_initialize_adds_seller_id_to_existing_listing_table(tmp_path):
     with database.engine.connect() as connection:
         columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(listings)")}
     assert "seller_id" in columns
+
+
+def test_initialize_adds_beta_control_columns_without_data_loss(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'beta-migration.db'}")
+    database.initialize()
+    with database.engine.begin() as connection:
+        connection.exec_driver_sql("ALTER TABLE users DROP COLUMN is_admin")
+        for column in (
+            "return_reason", "return_notes", "return_tracking_number",
+            "return_requested_at", "return_approved_at", "return_received_at",
+        ):
+            connection.exec_driver_sql(f"ALTER TABLE orders DROP COLUMN {column}")
+        connection.exec_driver_sql("DROP INDEX ix_scan_jobs_next_attempt_at")
+        connection.exec_driver_sql("ALTER TABLE scan_jobs DROP COLUMN next_attempt_at")
+
+    database.initialize()
+
+    inspector = inspect(database.engine)
+    assert "is_admin" in {column["name"] for column in inspector.get_columns("users")}
+    assert "return_reason" in {column["name"] for column in inspector.get_columns("orders")}
+    assert "next_attempt_at" in {column["name"] for column in inspector.get_columns("scan_jobs")}
+    assert "device_tokens" in inspector.get_table_names()
 
 
 def test_database_saves_listing_metadata_and_replaces_image_keys(tmp_path):

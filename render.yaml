@@ -13,6 +13,12 @@ services:
         sync: false
       - key: GEMINI_MODEL
         value: gemini-3.1-flash-lite
+      - key: GEMINI_FALLBACK_MODELS
+        value: ""
+      - key: GEMINI_JOB_MAX_ATTEMPTS
+        value: "3"
+      - key: GEMINI_RETRY_BASE_SECONDS
+        value: "12"
       - key: MAX_IMAGES
         value: "9"
       - key: DATABASE_URL
@@ -38,6 +44,12 @@ services:
       - key: STRIPE_PUBLISHABLE_KEY
         sync: false
       - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: ADMIN_EMAILS
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: LEGACY_CLAIM_CODE
         sync: false

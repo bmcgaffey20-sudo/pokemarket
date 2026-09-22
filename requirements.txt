@@ -9,3 +9,4 @@ boto3>=1.35,<2
 SQLAlchemy>=2.0.43,<3
 psycopg[binary]>=3.3,<4
 stripe>=11,<13
+google-auth>=2.36,<3
