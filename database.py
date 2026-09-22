@@ -554,6 +554,62 @@ class Database:
             ).scalar_one_or_none()
             return self._listing_dict(listing) if listing else None
 
+    def prepare_listing_deletion(self, listing_id, seller_id):
+        """Resolve owned records and R2 keys before an irreversible deletion."""
+        with self.sessions() as session:
+            listing = session.get(Listing, listing_id)
+            if listing is None or listing.seller_id != seller_id:
+                raise ListingOwnershipError("Listing not found.")
+
+            listings = [listing]
+            # Release 0.15.0 could split metadata and uploaded photos across two
+            # owned drafts. Clean up that narrowly identifiable orphan as well.
+            if listing.scan_id and listing.scan_id != listing.id and not listing.images:
+                linked = session.get(Listing, listing.scan_id)
+                if (
+                    linked is not None
+                    and linked.seller_id == seller_id
+                    and linked.photos_persisted
+                    and not (linked.title or "").strip()
+                ):
+                    listings.append(linked)
+
+            ids = [item.id for item in listings]
+            order_exists = session.execute(
+                select(Order.id).where(Order.listing_id.in_(ids)).limit(1)
+            ).first()
+            if order_exists:
+                raise ListingValidationError(
+                    "Cards with checkout or order history cannot be deleted. Archive the listing instead."
+                )
+            keys = [image.object_key for item in listings for image in item.images]
+            return {"listing_ids": ids, "object_keys": keys}
+
+    def delete_owned_listings(self, listing_ids, seller_id):
+        try:
+            with self.sessions.begin() as session:
+                listings = session.execute(
+                    select(Listing).where(
+                        Listing.id.in_(listing_ids),
+                        Listing.seller_id == seller_id,
+                    )
+                ).scalars().all()
+                if len(listings) != len(set(listing_ids)):
+                    raise ListingOwnershipError("Listing not found.")
+                if session.execute(
+                    select(Order.id).where(Order.listing_id.in_(listing_ids)).limit(1)
+                ).first():
+                    raise ListingValidationError(
+                        "Cards with checkout or order history cannot be deleted. Archive the listing instead."
+                    )
+                for listing in listings:
+                    session.delete(listing)
+            return len(listings)
+        except (ListingOwnershipError, ListingValidationError):
+            raise
+        except Exception as exc:
+            raise DatabaseOperationError(f"Could not delete listing: {exc}") from exc
+
     @staticmethod
     def _scan_job_dict(job):
         return {
@@ -672,6 +728,45 @@ class Database:
                 .offset(offset)
             ).scalars().all()
             return [self._listing_dict(listing) for listing in listings]
+
+    def repair_split_listings(self, seller_id):
+        """Merge the brief 0.15.0 metadata/photo split without copying R2 data."""
+        repaired = 0
+        with self.sessions.begin() as session:
+            metadata_listings = session.execute(
+                select(Listing).where(
+                    Listing.seller_id == seller_id,
+                    Listing.scan_id.is_not(None),
+                    Listing.photos_persisted.is_(False),
+                )
+            ).scalars().all()
+            for metadata in metadata_listings:
+                linked_id = metadata.scan_id
+                if not linked_id or linked_id == metadata.id:
+                    continue
+                linked = session.get(Listing, linked_id)
+                if (
+                    linked is None
+                    or linked.seller_id != seller_id
+                    or not linked.photos_persisted
+                    or (linked.title or "").strip()
+                ):
+                    continue
+                if session.execute(
+                    select(Order.id).where(Order.listing_id == linked.id).limit(1)
+                ).first():
+                    continue
+                session.execute(
+                    update(ListingImage)
+                    .where(ListingImage.listing_id == linked.id)
+                    .values(listing_id=metadata.id)
+                )
+                metadata.photos_persisted = True
+                metadata.updated_at = utc_now()
+                session.execute(delete(ScanJob).where(ScanJob.listing_id == linked.id))
+                session.execute(delete(Listing).where(Listing.id == linked.id))
+                repaired += 1
+        return repaired
 
     @staticmethod
     def _order_dict(order, listing=None, buyer=None, seller=None):

@@ -1,4 +1,4 @@
-# PokeMarket Backend 2.11.0 — queued scans
+# PokeMarket Backend 2.12.0 — complete listings
 
 Read UPDATE-2.7.1.md first for Mailjet setup, deployment and recovery testing.
 UPDATE-2.6.0.md documents publishing and public-photo behavior.
@@ -60,6 +60,8 @@ Listing endpoints:
 - `PUT /api/v1/listings/{listing_id}` creates or updates listing metadata.
 - `GET /api/v1/listings/{listing_id}` retrieves one listing and fresh signed URLs.
 - `GET /api/v1/listings` retrieves the most recently updated listings.
+- `DELETE /api/v1/listings/{listing_id}` permanently removes an owned card and
+  its private R2 objects when it has no checkout or order history.
 - Both image-upload endpoints create a seller-owned blank draft listing
   automatically when the listing ID does not yet exist.
 
@@ -122,7 +124,7 @@ Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
 After deployment, `/api/v1/health` should include version
-`2.11.0-queued-scans`, `database:"connected"`, `auth:"configured"`, and
+`2.12.0-complete-listings`, `database:"connected"`, `auth:"configured"`, and
 `payments:"configured"` when both Stripe test keys are present.
 
 At startup, SQLAlchemy safely adds the order shipping-address and payout fields

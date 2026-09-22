@@ -262,3 +262,9 @@ class ListingResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     images: list[ListingImageRecord] = Field(default_factory=list)
+
+class ListingDeleteResponse(BaseModel):
+    status: Literal["deleted"]
+    listing_id: str
+    deleted_listings: int
+    deleted_objects: int

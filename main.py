@@ -44,6 +44,7 @@ from schemas import (
     LoginRequest,
     ListingImageUploadResponse,
     ListingResponse,
+    ListingDeleteResponse,
     ListingUpsertRequest,
     RegisterRequest,
     ScanAnalysisResponse,
@@ -71,7 +72,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.11.0-queued-scans")
+app = FastAPI(title=settings.app_name, version="2.12.0-complete-listings")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -222,7 +223,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.11.0-queued-scans",
+        version="2.12.0-complete-listings",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -924,6 +925,44 @@ async def read_listing(
     return add_image_urls(record)
 
 
+@app.delete("/api/v1/listings/{listing_id}", response_model=ListingDeleteResponse)
+async def delete_listing(
+    listing_id: str,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
+    try:
+        listing_id = R2Storage.validate_listing_id(listing_id)
+        deletion = await asyncio.to_thread(
+            database.prepare_listing_deletion,
+            listing_id,
+            current_user["id"],
+        )
+        object_keys = deletion["object_keys"]
+        if object_keys:
+            await asyncio.to_thread(get_r2_storage().delete_objects, object_keys)
+        deleted_count = await asyncio.to_thread(
+            database.delete_owned_listings,
+            deletion["listing_ids"],
+            current_user["id"],
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ListingOwnershipError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ListingValidationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except (DatabaseOperationError, R2UploadError) as exc:
+        logger.exception("Listing deletion failed for %s", listing_id)
+        raise HTTPException(502, str(exc)) from exc
+    return ListingDeleteResponse(
+        status="deleted",
+        listing_id=listing_id,
+        deleted_listings=deleted_count,
+        deleted_objects=len(object_keys),
+    )
+
+
 @app.get("/api/v1/listings", response_model=list[ListingResponse])
 async def read_listings(
     limit: int = 50,
@@ -935,6 +974,7 @@ async def read_listings(
         raise HTTPException(400, "limit must be between 1 and 100.")
     if offset < 0:
         raise HTTPException(400, "offset cannot be negative.")
+    await asyncio.to_thread(database.repair_split_listings, current_user["id"])
     records = await asyncio.to_thread(
         database.list_listings,
         current_user["id"],
