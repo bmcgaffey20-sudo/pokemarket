@@ -17,6 +17,12 @@ services:
         value: "9"
       - key: DATABASE_URL
         sync: false
+      - key: DATABASE_POOL_SIZE
+        value: "3"
+      - key: DATABASE_MAX_OVERFLOW
+        value: "2"
+      - key: DATABASE_POOL_TIMEOUT_SECONDS
+        value: "15"
       - key: AUTH_SECRET
         sync: false
       - key: MAILJET_API_KEY

@@ -1,4 +1,4 @@
-# PokeMarket Backend 2.7.1 — Mailjet
+# PokeMarket Backend 2.11.0 — queued scans
 
 Read UPDATE-2.7.1.md first for Mailjet setup, deployment and recovery testing.
 UPDATE-2.6.0.md documents publishing and public-photo behavior.
@@ -28,7 +28,7 @@ stores the image binary or temporary signed URL.
 
 ## Database records
 
-The service creates three tables on first connection:
+The service creates the application tables on first connection, including:
 
 - `users`: email, display name, password hash parameters, seller tier, activity
   counters, and listing limit.
@@ -39,6 +39,7 @@ The service creates three tables on first connection:
   and whether the image is a defect close-up.
 - `orders`: buyer, seller, listing, Stripe payment state, 4% marketplace
   commission, delivery-protection hold, and seller payout state.
+- `scan_jobs`: durable queued/processing/completed AI scan state and results.
 
 Originals use versioned private keys such as:
 
@@ -49,11 +50,10 @@ originals before PostgreSQL commits. After the database transaction succeeds,
 the prior objects are removed. If the database transaction fails, the newly
 uploaded objects are rolled back instead.
 
-`POST /api/v1/listings/{listing_id}/images` exposes four named file controls in
-Swagger for a manual storage test. `POST /api/v1/scan/upload` retains the Android
-client's labelled multi-file contract, including up to five `defect_*`
-close-ups. Responses contain private, one-hour signed URLs; R2 credentials never
-go in the Android application.
+Android uses the direct-upload session and completion endpoints so full-quality
+originals bypass Render. It then submits `/api/v1/scan/jobs`; a durable worker
+reads those private originals from R2 and stores the completed result for polling.
+R2 credentials never go in the Android application.
 
 Listing endpoints:
 
@@ -98,9 +98,12 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 Render Environment:
 ENVIRONMENT=production
 AI_PROVIDER=gemini
-GEMINI_MODEL=gemini-3.8-flash
+GEMINI_MODEL=gemini-3.1-flash-lite
 GEMINI_API_KEY=<your secret key>
 DATABASE_URL=<your Neon pooled PostgreSQL connection string>
+DATABASE_POOL_SIZE=3
+DATABASE_MAX_OVERFLOW=2
+DATABASE_POOL_TIMEOUT_SECONDS=15
 AUTH_SECRET=<at least 32 random characters>
 LEGACY_CLAIM_CODE=<a different private random setup code>
 R2_BUCKET_NAME=pokemart-images
@@ -119,7 +122,7 @@ Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
 After deployment, `/api/v1/health` should include version
-`2.10.0-bandwidth-optimized`, `database:"connected"`, `auth:"configured"`, and
+`2.11.0-queued-scans`, `database:"connected"`, `auth:"configured"`, and
 `payments:"configured"` when both Stripe test keys are present.
 
 At startup, SQLAlchemy safely adds the order shipping-address and payout fields

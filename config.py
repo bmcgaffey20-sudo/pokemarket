@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     max_images: int = 9
     tcgdex_base_url: str = "https://api.tcgdex.net/v2"
     database_url: str | None = None
+    database_pool_size: int = 3
+    database_max_overflow: int = 2
+    database_pool_timeout_seconds: int = 15
     auth_secret: str | None = None
     legacy_claim_code: str | None = None
     mailjet_api_key: str | None = None
@@ -32,6 +35,7 @@ class Settings(BaseSettings):
     marketplace_commission_percent: int = 4
     ebay_commission_percent: int = 1
     seller_hold_days: int = 10
+    scan_worker_poll_seconds: float = 1.0
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 
     @property

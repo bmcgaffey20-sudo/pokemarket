@@ -56,6 +56,9 @@ from schemas import (
     DirectUploadSessionRequest,
     DirectUploadSessionResponse,
     DirectUploadCompleteRequest,
+    ScanJobRequest,
+    ScanJobAccepted,
+    ScanJobStatus,
 )
 from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
@@ -68,7 +71,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.10.0-bandwidth-optimized")
+app = FastAPI(title=settings.app_name, version="2.11.0-queued-scans")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -109,7 +112,12 @@ app.add_middleware(
 
 @lru_cache
 def get_database_client():
-    database = Database(settings.database_url)
+    database = Database(
+        settings.database_url,
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        pool_timeout=settings.database_pool_timeout_seconds,
+    )
     database.initialize()
     return database
 
@@ -214,7 +222,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.10.0-bandwidth-optimized",
+        version="2.11.0-queued-scans",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -481,16 +489,12 @@ def apply_grading_safeguards(condition, images):
     return condition
 
 
-@app.post("/api/v1/scan/analyze", response_model=ScanAnalysisResponse)
-async def analyze_scan(
-    files: list[UploadFile] = File(...),
-    include_condition: bool = Form(True),
-    include_authenticity: bool = Form(True),
-    _scan_slot=Depends(acquire_scan_slot),
-    _current_user=Depends(require_user),
+async def perform_scan_analysis(
+    images,
+    include_condition=True,
+    include_authenticity=True,
+    scan_id=None,
 ):
-    images = await read_images(files)
-
     try:
         provider = get_ai_provider(settings)
         # Identification, condition and authenticity share one image-bearing
@@ -584,7 +588,7 @@ async def analyze_scan(
     )
 
     return ScanAnalysisResponse(
-        scan_id=new_scan_id(),
+        scan_id=scan_id or new_scan_id(),
         status="complete",
         provider=provider.name,
         identification=identification,
@@ -595,11 +599,152 @@ async def analyze_scan(
     )
 
 
+@app.post("/api/v1/scan/analyze", response_model=ScanAnalysisResponse)
+async def analyze_scan(
+    files: list[UploadFile] = File(...),
+    include_condition: bool = Form(True),
+    include_authenticity: bool = Form(True),
+    _scan_slot=Depends(acquire_scan_slot),
+    _current_user=Depends(require_user),
+):
+    """Compatibility endpoint for older Android builds."""
+    images = await read_images(files)
+    return await perform_scan_analysis(
+        images,
+        include_condition=include_condition,
+        include_authenticity=include_authenticity,
+    )
+
+
 def get_r2_storage():
     try:
         return R2Storage(settings)
     except R2ConfigurationError as exc:
         raise HTTPException(503, str(exc)) from exc
+
+
+scan_worker_task = None
+
+
+async def scan_worker_loop():
+    """Durable single-consumer queue for memory-heavy Gemini scans."""
+    while True:
+        job = None
+        try:
+            database = await asyncio.to_thread(get_database_client)
+            job = await asyncio.to_thread(database.claim_next_scan_job)
+            if job is None:
+                await asyncio.sleep(settings.scan_worker_poll_seconds)
+                continue
+
+            listing = await asyncio.to_thread(
+                database.get_listing,
+                job["listing_id"],
+                job["user_id"],
+            )
+            if listing is None or not listing.get("photos_persisted"):
+                raise RuntimeError("The queued listing photos are no longer available.")
+
+            storage = get_r2_storage()
+            images = await asyncio.to_thread(
+                storage.download_images,
+                listing["images"],
+                settings.max_image_bytes,
+            )
+            async with scan_semaphore:
+                result = await perform_scan_analysis(
+                    images,
+                    include_condition=job["include_condition"],
+                    include_authenticity=job["include_authenticity"],
+                    scan_id=job["listing_id"],
+                )
+            await asyncio.to_thread(
+                database.finish_scan_job,
+                job["job_id"],
+                result.model_dump(mode="json"),
+                None,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Background scan job failed")
+            if "job" in locals() and job:
+                try:
+                    await asyncio.to_thread(
+                        database.finish_scan_job,
+                        job["job_id"],
+                        None,
+                        f"{type(exc).__name__}: {exc}"[:2000],
+                    )
+                except Exception:
+                    logger.exception("Could not record scan-job failure")
+            await asyncio.sleep(settings.scan_worker_poll_seconds)
+        finally:
+            gc.collect()
+
+
+@app.on_event("startup")
+async def start_scan_worker():
+    global scan_worker_task
+    try:
+        database = await asyncio.to_thread(get_database_client)
+        await asyncio.to_thread(database.requeue_interrupted_scan_jobs)
+    except Exception:
+        logger.exception("Scan queue initialization will retry in the worker")
+    scan_worker_task = asyncio.create_task(scan_worker_loop())
+
+
+@app.on_event("shutdown")
+async def stop_scan_worker():
+    global scan_worker_task
+    if scan_worker_task is not None:
+        scan_worker_task.cancel()
+        try:
+            await scan_worker_task
+        except asyncio.CancelledError:
+            pass
+        scan_worker_task = None
+
+
+@app.post("/api/v1/scan/jobs", response_model=ScanJobAccepted, status_code=202)
+async def queue_scan_job(
+    payload: ScanJobRequest,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
+    try:
+        listing_id = R2Storage.validate_listing_id(payload.listing_id)
+        job = await asyncio.to_thread(
+            database.create_scan_job,
+            str(uuid.uuid4()),
+            listing_id,
+            current_user["id"],
+            payload.include_condition,
+            payload.include_authenticity,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ListingOwnershipError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except DatabaseOperationError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return ScanJobAccepted(**job)
+
+
+@app.get("/api/v1/scan/jobs/{job_id}", response_model=ScanJobStatus)
+async def read_scan_job(
+    job_id: str,
+    current_user=Depends(require_user),
+    database=Depends(require_database),
+):
+    try:
+        uuid.UUID(job_id)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid scan job ID.") from exc
+    job = await asyncio.to_thread(database.get_scan_job, job_id, current_user["id"])
+    if job is None:
+        raise HTTPException(404, "Scan job not found.")
+    return ScanJobStatus(**job)
 
 
 def add_image_urls(record):

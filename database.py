@@ -201,14 +201,35 @@ class Order(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
 
+class ScanJob(Base):
+    __tablename__ = "scan_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    listing_id: Mapped[str] = mapped_column(String(64), ForeignKey("listings.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="queued", nullable=False, index=True)
+    include_condition: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    include_authenticity: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
 class Database:
-    def __init__(self, database_url):
+    def __init__(self, database_url, pool_size=3, max_overflow=2, pool_timeout=15):
         url = normalize_database_url(database_url)
         engine_options = {"pool_pre_ping": True, "future": True}
         if url.startswith("sqlite"):
             engine_options["connect_args"] = {"check_same_thread": False}
         else:
-            engine_options["pool_recycle"] = 300
+            engine_options.update(
+                pool_recycle=300,
+                pool_size=max(1, int(pool_size)),
+                max_overflow=max(0, int(max_overflow)),
+                pool_timeout=max(1, int(pool_timeout)),
+            )
         self.engine = create_engine(url, **engine_options)
         self.sessions = sessionmaker(bind=self.engine, expire_on_commit=False, future=True)
 
@@ -532,6 +553,83 @@ class Database:
                 )
             ).scalar_one_or_none()
             return self._listing_dict(listing) if listing else None
+
+    @staticmethod
+    def _scan_job_dict(job):
+        return {
+            "job_id": job.id,
+            "listing_id": job.listing_id,
+            "user_id": job.user_id,
+            "status": job.status,
+            "include_condition": job.include_condition,
+            "include_authenticity": job.include_authenticity,
+            "result": job.result,
+            "error": job.error,
+            "attempts": job.attempts,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+        }
+
+    def create_scan_job(self, job_id, listing_id, user_id, include_condition=True, include_authenticity=True):
+        try:
+            with self.sessions.begin() as session:
+                listing = session.get(Listing, listing_id)
+                if listing is None or listing.seller_id != user_id or not listing.photos_persisted:
+                    raise ListingOwnershipError("Listing photos are not available for analysis.")
+                job = ScanJob(
+                    id=job_id,
+                    listing_id=listing_id,
+                    user_id=user_id,
+                    include_condition=include_condition,
+                    include_authenticity=include_authenticity,
+                )
+                session.add(job)
+                session.flush()
+                return self._scan_job_dict(job)
+        except ListingOwnershipError:
+            raise
+        except Exception as exc:
+            raise DatabaseOperationError(f"Could not queue scan: {exc}") from exc
+
+    def get_scan_job(self, job_id, user_id):
+        with self.sessions() as session:
+            job = session.get(ScanJob, job_id)
+            if job is None or job.user_id != user_id:
+                return None
+            return self._scan_job_dict(job)
+
+    def claim_next_scan_job(self):
+        with self.sessions.begin() as session:
+            statement = select(ScanJob).where(ScanJob.status == "queued").order_by(ScanJob.created_at).limit(1)
+            if self.engine.dialect.name == "postgresql":
+                statement = statement.with_for_update(skip_locked=True)
+            job = session.execute(statement).scalar_one_or_none()
+            if job is None:
+                return None
+            job.status = "processing"
+            job.attempts += 1
+            job.updated_at = utc_now()
+            session.flush()
+            return self._scan_job_dict(job)
+
+    def finish_scan_job(self, job_id, result=None, error=None):
+        with self.sessions.begin() as session:
+            job = session.get(ScanJob, job_id, with_for_update=True)
+            if job is None:
+                return None
+            job.status = "complete" if error is None else "failed"
+            job.result = result if error is None else None
+            job.error = error
+            job.updated_at = utc_now()
+            return self._scan_job_dict(job)
+
+    def requeue_interrupted_scan_jobs(self):
+        with self.sessions.begin() as session:
+            return session.execute(
+                update(ScanJob)
+                .where(ScanJob.status == "processing")
+                .values(status="queued", updated_at=utc_now())
+            ).rowcount
 
     def set_publication(self, listing_id, seller_id, publish):
         with self.sessions.begin() as session:

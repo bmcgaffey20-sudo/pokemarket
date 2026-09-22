@@ -194,3 +194,20 @@ class R2Storage:
             Params={"Bucket": self.bucket_name, "Key": object_key},
             ExpiresIn=self.url_expiry,
         )
+
+    def download_images(self, images, max_image_bytes):
+        """Load verified private originals for the background AI worker."""
+        downloaded = []
+        for image in images:
+            try:
+                response = self.client.get_object(
+                    Bucket=self.bucket_name,
+                    Key=image["object_key"],
+                )
+                data = response["Body"].read(max_image_bytes + 1)
+            except Exception as exc:
+                raise R2UploadError(f"Could not read an R2 scan image: {exc}") from exc
+            if not data or len(data) > max_image_bytes:
+                raise R2UploadError("An R2 scan image has an invalid size.")
+            downloaded.append((data, image["content_type"], image["label"]))
+        return downloaded

@@ -150,6 +150,23 @@ class ScanAnalysisResponse(BaseModel):
     tcgdex: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
 
+class ScanJobRequest(BaseModel):
+    listing_id: str = Field(min_length=1, max_length=64)
+    include_condition: bool = True
+    include_authenticity: bool = True
+
+class ScanJobAccepted(BaseModel):
+    job_id: str
+    listing_id: str
+    status: Literal["queued", "processing"]
+
+class ScanJobStatus(BaseModel):
+    job_id: str
+    listing_id: str
+    status: Literal["queued", "processing", "complete", "failed"]
+    result: ScanAnalysisResponse | None = None
+    error: str | None = None
+
 class StoredImage(BaseModel):
     label: str
     object_key: str
