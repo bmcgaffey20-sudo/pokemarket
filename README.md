@@ -1,4 +1,4 @@
-# PokeMarket Backend 2.12.0 — complete listings
+# PokeMarket Backend 2.12.1 — legacy deletion compatibility
 
 Read UPDATE-2.7.1.md first for Mailjet setup, deployment and recovery testing.
 UPDATE-2.6.0.md documents publishing and public-photo behavior.
@@ -124,7 +124,7 @@ Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
 After deployment, `/api/v1/health` should include version
-`2.12.0-complete-listings`, `database:"connected"`, `auth:"configured"`, and
+`2.12.1-legacy-delete`, `database:"connected"`, `auth:"configured"`, and
 `payments:"configured"` when both Stripe test keys are present.
 
 At startup, SQLAlchemy safely adds the order shipping-address and payout fields

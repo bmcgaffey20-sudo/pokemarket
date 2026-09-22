@@ -558,6 +558,16 @@ class Database:
         """Resolve owned records and R2 keys before an irreversible deletion."""
         with self.sessions() as session:
             listing = session.get(Listing, listing_id)
+            if listing is None:
+                # Early Android releases sometimes retained the scan ID as the
+                # local card ID after the cloud listing received a different ID.
+                # scan_id is unique, so it is a safe backwards-compatible alias.
+                listing = session.execute(
+                    select(Listing).where(
+                        Listing.scan_id == listing_id,
+                        Listing.seller_id == seller_id,
+                    )
+                ).scalar_one_or_none()
             if listing is None or listing.seller_id != seller_id:
                 raise ListingOwnershipError("Listing not found.")
 

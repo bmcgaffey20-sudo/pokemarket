@@ -15,7 +15,7 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.12.0-complete-listings"
+    assert r.json()["version"] == "2.12.1-legacy-delete"
     assert r.json()["database"] in {"not_configured", "connected"}
     assert r.json()["auth"] in {"not_configured", "configured"}
 
@@ -257,6 +257,32 @@ def test_database_saves_listing_metadata_and_replaces_image_keys(tmp_path):
     assert [image["object_key"] for image in replaced["images"]] == [
         second[0]["object_key"]
     ]
+
+
+def test_legacy_scan_id_can_resolve_listing_deletion(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'legacy-delete.db'}")
+    database.initialize()
+    seller, _ = database.create_user(
+        "seller-legacy",
+        "legacy-delete@example.com",
+        "Legacy Seller",
+        "hash",
+        "salt",
+        1,
+        False,
+    )
+    database.upsert_listing(
+        "cloud-listing-id",
+        {"scan_id": "old-phone-card-id", "title": "Legacy card", "status": "draft"},
+        seller["id"],
+    )
+
+    deletion = database.prepare_listing_deletion("old-phone-card-id", seller["id"])
+
+    assert deletion["listing_ids"] == ["cloud-listing-id"]
+    assert deletion["object_keys"] == []
+    assert database.delete_owned_listings(deletion["listing_ids"], seller["id"]) == 1
+    assert database.get_listing("cloud-listing-id", seller["id"]) is None
 
 
 def test_password_hash_and_signed_token_round_trip():
