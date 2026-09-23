@@ -16,7 +16,7 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.13.0-beta-control"
+    assert r.json()["version"] == "2.14.0-auto-settlement"
     assert r.json()["database"] in {"not_configured", "connected"}
     assert r.json()["auth"] in {"not_configured", "configured"}
 
@@ -209,9 +209,12 @@ def test_initialize_adds_beta_control_columns_without_data_loss(tmp_path):
     database.initialize()
     with database.engine.begin() as connection:
         connection.exec_driver_sql("ALTER TABLE users DROP COLUMN is_admin")
+        connection.exec_driver_sql("DROP INDEX ix_orders_delivery_confirmation_due_at")
+        connection.exec_driver_sql("DROP INDEX ix_orders_return_confirmation_due_at")
         for column in (
             "return_reason", "return_notes", "return_tracking_number",
             "return_requested_at", "return_approved_at", "return_received_at",
+            "delivery_confirmation_due_at", "return_confirmation_due_at",
         ):
             connection.exec_driver_sql(f"ALTER TABLE orders DROP COLUMN {column}")
         connection.exec_driver_sql("DROP INDEX ix_scan_jobs_next_attempt_at")
@@ -222,6 +225,8 @@ def test_initialize_adds_beta_control_columns_without_data_loss(tmp_path):
     inspector = inspect(database.engine)
     assert "is_admin" in {column["name"] for column in inspector.get_columns("users")}
     assert "return_reason" in {column["name"] for column in inspector.get_columns("orders")}
+    assert "delivery_confirmation_due_at" in {column["name"] for column in inspector.get_columns("orders")}
+    assert "return_confirmation_due_at" in {column["name"] for column in inspector.get_columns("orders")}
     assert "next_attempt_at" in {column["name"] for column in inspector.get_columns("scan_jobs")}
     assert "device_tokens" in inspector.get_table_names()
 

@@ -110,6 +110,7 @@ class OrderResponse(BaseModel):
     buyer_display_name: str | None = None
     seller_display_name: str | None = None
     delivered_at: datetime | None = None
+    delivery_confirmation_due_at: datetime | None = None
     hold_until: datetime | None = None
     completed_at: datetime | None = None
     payout_status: str = "pending"
@@ -121,6 +122,7 @@ class OrderResponse(BaseModel):
     return_requested_at: datetime | None = None
     return_approved_at: datetime | None = None
     return_received_at: datetime | None = None
+    return_confirmation_due_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

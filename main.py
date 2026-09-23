@@ -78,7 +78,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.13.0-beta-control")
+app = FastAPI(title=settings.app_name, version="2.14.0-auto-settlement")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -241,7 +241,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.13.0-beta-control",
+        version="2.14.0-auto-settlement",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -711,6 +711,119 @@ def get_r2_storage():
 
 
 scan_worker_task = None
+settlement_worker_task = None
+
+
+async def settle_seller_payout(order, database):
+    """Issue or retry a seller transfer with a stable Stripe idempotency key."""
+    if not order or order.get("payout_status") == "paid":
+        return order
+    seller = await asyncio.to_thread(database.get_user, order["seller_id"])
+    account_id = seller.get("stripe_account_id") if seller else None
+    if not account_id or order["seller_amount_cents"] <= 0:
+        logger.warning("Automatic payout is waiting for seller account on order %s", order["id"])
+        return order
+    try:
+        stripe_client = require_stripe()
+        transfer = await asyncio.to_thread(
+            stripe_client.Transfer.create,
+            amount=order["seller_amount_cents"],
+            currency=order["currency"].lower(),
+            destination=account_id,
+            metadata={"order_id": order["id"], "listing_id": order["listing_id"]},
+            idempotency_key=f"pokemarket-order-payout-{order['id']}",
+        )
+        return await asyncio.to_thread(database.mark_payout, order["id"], "paid", transfer["id"])
+    except Exception:
+        logger.exception("Automatic seller payout failed for order %s", order["id"])
+        return await asyncio.to_thread(database.mark_payout, order["id"], "failed")
+
+
+async def settle_buyer_refund(order, database):
+    """Issue or retry a return refund with a stable Stripe idempotency key."""
+    if not order or order.get("status") == "refunded":
+        return order
+    if not order.get("stripe_payment_intent_id"):
+        logger.error("Automatic return refund has no payment intent for order %s", order["id"])
+        return order
+    try:
+        stripe_client = require_stripe()
+        refund = await asyncio.to_thread(
+            stripe_client.Refund.create,
+            payment_intent=order["stripe_payment_intent_id"],
+            metadata={"order_id": order["id"], "reason": "return_confirmation_timeout"},
+            idempotency_key=f"pokemarket-return-{order['id']}",
+        )
+        return await asyncio.to_thread(database.mark_order_refunded, order["id"], refund["id"])
+    except Exception:
+        logger.exception("Automatic buyer refund failed for order %s", order["id"])
+        return order
+
+
+async def process_due_settlements(database):
+    """Finalize expired confirmations and retry incomplete Stripe settlements."""
+    purchases = await asyncio.to_thread(database.list_due_purchase_settlements)
+    for candidate in purchases:
+        transitioned = candidate["status"] != "completed"
+        order = await asyncio.to_thread(database.complete_due_order, candidate["id"])
+        if order is None:
+            continue
+        order = await settle_seller_payout(order, database)
+        if transitioned:
+            body = (
+                "The 10-day confirmation deadline ended and the seller payout was released."
+                if order.get("payout_status") == "paid"
+                else "The 10-day confirmation deadline ended. The order completed and the seller payout will retry automatically."
+            )
+            await send_push(
+                settings,
+                database,
+                [order["buyer_id"], order["seller_id"]],
+                "Order automatically completed",
+                body,
+                {"page": "orders", "order_id": order["id"]},
+            )
+
+    returns = await asyncio.to_thread(database.list_due_return_settlements)
+    for candidate in returns:
+        transitioned = candidate["status"] == "return_shipped"
+        order = await asyncio.to_thread(database.begin_due_return_refund, candidate["id"])
+        if order is None:
+            continue
+        order = await settle_buyer_refund(order, database)
+        if transitioned:
+            body = (
+                "The 10-day return deadline ended and the buyer refund was issued."
+                if order.get("status") == "refunded"
+                else "The 10-day return deadline ended. Return receipt was confirmed and the buyer refund will retry automatically."
+            )
+            await send_push(
+                settings,
+                database,
+                [order["buyer_id"], order["seller_id"]],
+                "Return automatically confirmed",
+                body,
+                {"page": "orders", "order_id": order["id"]},
+            )
+
+
+async def settlement_worker_loop():
+    deadlines_ready = False
+    while True:
+        try:
+            database = await asyncio.to_thread(get_database_client)
+            if not deadlines_ready:
+                await asyncio.to_thread(
+                    database.backfill_confirmation_deadlines,
+                    settings.confirmation_timeout_days,
+                )
+                deadlines_ready = True
+            await process_due_settlements(database)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Automatic settlement worker failed")
+        await asyncio.sleep(max(5, settings.settlement_worker_poll_seconds))
 
 
 async def scan_worker_loop():
@@ -790,25 +903,33 @@ async def scan_worker_loop():
 
 @app.on_event("startup")
 async def start_scan_worker():
-    global scan_worker_task
+    global scan_worker_task, settlement_worker_task
     try:
         database = await asyncio.to_thread(get_database_client)
         await asyncio.to_thread(database.requeue_interrupted_scan_jobs)
+        await asyncio.to_thread(
+            database.backfill_confirmation_deadlines,
+            settings.confirmation_timeout_days,
+        )
     except Exception:
-        logger.exception("Scan queue initialization will retry in the worker")
+        logger.exception("Background-worker initialization will retry")
     scan_worker_task = asyncio.create_task(scan_worker_loop())
+    settlement_worker_task = asyncio.create_task(settlement_worker_loop())
 
 
 @app.on_event("shutdown")
 async def stop_scan_worker():
-    global scan_worker_task
-    if scan_worker_task is not None:
-        scan_worker_task.cancel()
+    global scan_worker_task, settlement_worker_task
+    for task in (scan_worker_task, settlement_worker_task):
+        if task is None:
+            continue
+        task.cancel()
         try:
-            await scan_worker_task
+            await task
         except asyncio.CancelledError:
             pass
-        scan_worker_task = None
+    scan_worker_task = None
+    settlement_worker_task = None
 
 
 @app.post("/api/v1/scan/jobs", response_model=ScanJobAccepted, status_code=202)
@@ -1523,7 +1644,13 @@ async def read_order(order_id: str, current_user=Depends(require_user), database
 @app.post("/api/v1/orders/{order_id}/tracking", response_model=OrderResponse)
 async def add_order_tracking(order_id: str, payload: TrackingRequest, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
     try:
-        order = await asyncio.to_thread(database.set_tracking, order_id, current_user["id"], payload.tracking_number.strip())
+        order = await asyncio.to_thread(
+            database.set_tracking,
+            order_id,
+            current_user["id"],
+            payload.tracking_number.strip(),
+            settings.confirmation_timeout_days,
+        )
     except ListingValidationError as exc:
         raise HTTPException(409, str(exc)) from exc
     if order is None:
@@ -1573,7 +1700,13 @@ async def review_order_return(order_id: str, payload: ReturnReviewRequest, backg
 @app.post("/api/v1/orders/{order_id}/returns/tracking", response_model=OrderResponse)
 async def add_return_tracking(order_id: str, payload: TrackingRequest, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
     try:
-        order = await asyncio.to_thread(database.set_return_tracking, order_id, current_user["id"], payload.tracking_number.strip())
+        order = await asyncio.to_thread(
+            database.set_return_tracking,
+            order_id,
+            current_user["id"],
+            payload.tracking_number.strip(),
+            settings.confirmation_timeout_days,
+        )
     except ListingValidationError as exc:
         raise HTTPException(409, str(exc)) from exc
     if order is None:
@@ -1611,7 +1744,12 @@ async def confirm_return_received(order_id: str, background: BackgroundTasks, cu
 @app.post("/api/v1/admin/orders/{order_id}/returns/resolve", response_model=OrderResponse)
 async def admin_resolve_return(order_id: str, payload: ReturnReviewRequest, background: BackgroundTasks, _admin=Depends(require_admin), database=Depends(require_database)):
     try:
-        order = await asyncio.to_thread(database.resolve_return_dispute, order_id, payload.approved)
+        order = await asyncio.to_thread(
+            database.resolve_return_dispute,
+            order_id,
+            payload.approved,
+            settings.confirmation_timeout_days,
+        )
     except ListingValidationError as exc:
         raise HTTPException(409, str(exc)) from exc
     if order is None:
@@ -1628,22 +1766,6 @@ async def complete_order(order_id: str, background: BackgroundTasks, current_use
         raise HTTPException(409, str(exc)) from exc
     if order is None:
         raise HTTPException(404, "Order not found.")
-    seller = await asyncio.to_thread(database.get_user, order["seller_id"])
-    account_id = seller.get("stripe_account_id") if seller else None
-    if account_id and order["seller_amount_cents"] > 0 and order["payout_status"] != "paid":
-        try:
-            stripe_client = require_stripe()
-            transfer = await asyncio.to_thread(
-                stripe_client.Transfer.create,
-                amount=order["seller_amount_cents"],
-                currency=order["currency"].lower(),
-                destination=account_id,
-                metadata={"order_id": order["id"], "listing_id": order["listing_id"]},
-                idempotency_key=f"pokemarket-order-payout-{order['id']}",
-            )
-            order = await asyncio.to_thread(database.mark_payout, order["id"], "paid", transfer["id"])
-        except Exception:
-            logger.exception("Seller payout failed for order %s", order_id)
-            order = await asyncio.to_thread(database.mark_payout, order["id"], "failed")
+    order = await settle_seller_payout(order, database)
     background.add_task(send_push, settings, database, [order["buyer_id"], order["seller_id"]], "Order completed", "The PokeMarket order is complete.", {"page": "orders", "order_id": order_id})
     return order

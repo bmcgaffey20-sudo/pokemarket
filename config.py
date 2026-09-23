@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     marketplace_commission_percent: int = 4
     ebay_commission_percent: int = 1
     seller_hold_days: int = 10
+    confirmation_timeout_days: int = 10
+    settlement_worker_poll_seconds: float = 60
     admin_emails: str = ""
     firebase_project_id: str | None = None
     firebase_service_account_json: str | None = None

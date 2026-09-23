@@ -3,6 +3,7 @@ import hashlib
 import time
 
 from sqlalchemy import (
+    and_,
     JSON,
     BigInteger,
     Boolean,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     create_engine,
     delete,
     inspect,
+    or_,
     select,
     text,
     update,
@@ -193,6 +195,7 @@ class Order(Base):
     shipping_postal_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
     shipping_country: Mapped[str | None] = mapped_column(String(2), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivery_confirmation_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     hold_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     payout_status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)
@@ -204,6 +207,7 @@ class Order(Base):
     return_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     return_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     return_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_confirmation_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
@@ -297,12 +301,14 @@ class Database:
                 ("shipping_state", "VARCHAR(120)"),
                 ("shipping_postal_code", "VARCHAR(32)"),
                 ("shipping_country", "VARCHAR(2)"),
+                ("delivery_confirmation_due_at", "TIMESTAMP"),
                 ("return_reason", "VARCHAR(64)"),
                 ("return_notes", "TEXT"),
                 ("return_tracking_number", "VARCHAR(128)"),
                 ("return_requested_at", "TIMESTAMP"),
                 ("return_approved_at", "TIMESTAMP"),
                 ("return_received_at", "TIMESTAMP"),
+                ("return_confirmation_due_at", "TIMESTAMP"),
             ):
                 if name not in order_columns:
                     connection.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {definition}"))
@@ -311,6 +317,12 @@ class Database:
             with self.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE scan_jobs ADD COLUMN next_attempt_at TIMESTAMP"))
         with self.engine.begin() as connection:
+            connection.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_orders_delivery_confirmation_due_at ON orders (delivery_confirmation_due_at)")
+            )
+            connection.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_orders_return_confirmation_due_at ON orders (return_confirmation_due_at)")
+            )
             connection.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_scan_jobs_next_attempt_at ON scan_jobs (next_attempt_at)")
             )
@@ -914,6 +926,7 @@ class Database:
             "shipping_postal_code": order.shipping_postal_code,
             "shipping_country": order.shipping_country,
             "delivered_at": order.delivered_at,
+            "delivery_confirmation_due_at": order.delivery_confirmation_due_at,
             "hold_until": order.hold_until, "completed_at": order.completed_at,
             "payout_status": order.payout_status, "stripe_transfer_id": order.stripe_transfer_id,
             "stripe_refund_id": order.stripe_refund_id,
@@ -923,6 +936,7 @@ class Database:
             "return_requested_at": order.return_requested_at,
             "return_approved_at": order.return_approved_at,
             "return_received_at": order.return_received_at,
+            "return_confirmation_due_at": order.return_confirmation_due_at,
             "created_at": order.created_at, "updated_at": order.updated_at,
         }
         if listing is not None:
@@ -1067,6 +1081,11 @@ class Database:
                 return None
             if order.status not in {"paid", "shipped", "delivered"}:
                 raise ListingValidationError("This order is not ready for delivery confirmation.")
+            delivery_due = order.delivery_confirmation_due_at
+            if delivery_due is not None and delivery_due.tzinfo is None:
+                delivery_due = delivery_due.replace(tzinfo=timezone.utc)
+            if order.status == "shipped" and delivery_due and delivery_due < utc_now():
+                raise ListingValidationError("The delivery confirmation deadline ended; automatic completion is processing.")
             order.status = "protection_hold"
             order.delivered_at = order.delivered_at or utc_now()
             order.hold_until = order.hold_until or utc_now() + timedelta(days=hold_days)
@@ -1100,15 +1119,18 @@ class Database:
             order.updated_at = utc_now()
             return self._order_dict(order)
 
-    def set_tracking(self, order_id, seller_id, tracking_number):
+    def set_tracking(self, order_id, seller_id, tracking_number, timeout_days=10):
         with self.sessions.begin() as session:
             order = session.get(Order, order_id, with_for_update=True)
             if order is None or order.seller_id != seller_id:
                 return None
             if order.status not in {"paid", "shipped"}:
                 raise ListingValidationError("Tracking can only be added to a paid order.")
+            first_shipment = order.status == "paid"
             order.tracking_number = tracking_number
             order.status = "shipped"
+            if first_shipment or order.delivery_confirmation_due_at is None:
+                order.delivery_confirmation_due_at = utc_now() + timedelta(days=timeout_days)
             order.updated_at = utc_now()
             return self._order_dict(order)
 
@@ -1117,10 +1139,16 @@ class Database:
             order = session.get(Order, order_id, with_for_update=True)
             if order is None or order.buyer_id != buyer_id:
                 return None
+            now = utc_now()
             hold_until = order.hold_until
             if hold_until is not None and hold_until.tzinfo is None:
                 hold_until = hold_until.replace(tzinfo=timezone.utc)
-            if order.status != "protection_hold" or not hold_until or hold_until < utc_now():
+            delivery_due = order.delivery_confirmation_due_at
+            if delivery_due is not None and delivery_due.tzinfo is None:
+                delivery_due = delivery_due.replace(tzinfo=timezone.utc)
+            protected_after_confirmation = order.status == "protection_hold" and hold_until and hold_until >= now
+            protected_while_awaiting_confirmation = order.status == "shipped" and delivery_due and delivery_due >= now
+            if not (protected_after_confirmation or protected_while_awaiting_confirmation):
                 raise ListingValidationError("Returns must be requested during the buyer-protection period.")
             order.status = "return_requested"
             order.return_reason = reason
@@ -1143,15 +1171,18 @@ class Database:
             order.updated_at = utc_now()
             return self._order_dict(order)
 
-    def set_return_tracking(self, order_id, buyer_id, tracking_number):
+    def set_return_tracking(self, order_id, buyer_id, tracking_number, timeout_days=10):
         with self.sessions.begin() as session:
             order = session.get(Order, order_id, with_for_update=True)
             if order is None or order.buyer_id != buyer_id:
                 return None
             if order.status not in {"return_approved", "return_shipped"}:
                 raise ListingValidationError("This return is not ready for return shipping.")
+            first_return_shipment = order.status == "return_approved"
             order.return_tracking_number = tracking_number
             order.status = "return_shipped"
+            if first_return_shipment or order.return_confirmation_due_at is None:
+                order.return_confirmation_due_at = utc_now() + timedelta(days=timeout_days)
             order.updated_at = utc_now()
             return self._order_dict(order)
 
@@ -1168,7 +1199,7 @@ class Database:
                 order.updated_at = utc_now()
             return self._order_dict(order)
 
-    def resolve_return_dispute(self, order_id, approved):
+    def resolve_return_dispute(self, order_id, approved, timeout_days=10):
         with self.sessions.begin() as session:
             order = session.get(Order, order_id, with_for_update=True)
             if order is None:
@@ -1181,7 +1212,118 @@ class Database:
             else:
                 order.status = "protection_hold"
                 order.payout_status = "pending"
+                if order.hold_until is None:
+                    order.delivered_at = order.delivered_at or utc_now()
+                    order.hold_until = order.delivery_confirmation_due_at or (
+                        utc_now() + timedelta(days=timeout_days)
+                    )
             order.updated_at = utc_now()
+            return self._order_dict(order)
+
+    def backfill_confirmation_deadlines(self, timeout_days=10):
+        """Give legacy in-flight shipments a durable deadline without resetting newer clocks."""
+        with self.sessions.begin() as session:
+            orders = session.execute(
+                select(Order).where(Order.status.in_(("shipped", "return_shipped")))
+            ).scalars().all()
+            changed = 0
+            for order in orders:
+                base = order.updated_at or order.created_at or utc_now()
+                if base.tzinfo is None:
+                    base = base.replace(tzinfo=timezone.utc)
+                if order.status == "shipped" and order.delivery_confirmation_due_at is None:
+                    order.delivery_confirmation_due_at = base + timedelta(days=timeout_days)
+                    changed += 1
+                elif order.status == "return_shipped" and order.return_confirmation_due_at is None:
+                    order.return_confirmation_due_at = base + timedelta(days=timeout_days)
+                    changed += 1
+            return changed
+
+    def list_due_purchase_settlements(self, now=None, limit=100):
+        now = now or utc_now()
+        with self.sessions() as session:
+            orders = session.execute(
+                select(Order).where(
+                    or_(
+                        and_(Order.status == "shipped", Order.delivery_confirmation_due_at <= now),
+                        and_(Order.status == "protection_hold", Order.hold_until <= now),
+                        and_(Order.status == "completed", Order.payout_status.in_(("pending", "failed"))),
+                    )
+                ).order_by(Order.updated_at).limit(limit)
+            ).scalars().all()
+            return [self._order_dict(order) for order in orders]
+
+    def list_due_return_settlements(self, now=None, limit=100):
+        now = now or utc_now()
+        with self.sessions() as session:
+            orders = session.execute(
+                select(Order).where(
+                    or_(
+                        and_(Order.status == "return_shipped", Order.return_confirmation_due_at <= now),
+                        and_(Order.status == "refund_pending", Order.return_reason.is_not(None)),
+                    )
+                ).order_by(Order.updated_at).limit(limit)
+            ).scalars().all()
+            return [self._order_dict(order) for order in orders]
+
+    @staticmethod
+    def _complete_locked_order(session, order, now):
+        order.status = "completed"
+        order.delivered_at = order.delivered_at or now
+        order.hold_until = order.hold_until or now
+        order.completed_at = now
+        order.updated_at = now
+        buyer, seller = session.get(User, order.buyer_id), session.get(User, order.seller_id)
+        buyer.completed_buys += 1
+        seller.successful_sales += 1
+        if order.item_cents >= 10_000:
+            seller.successful_sales_over_100 += 1
+        if seller.successful_sales_over_100 >= 5:
+            seller.seller_tier, seller.max_listing_cents = 5, 100_000
+        elif seller.completed_buys >= 5 and seller.successful_sales >= 5:
+            seller.seller_tier, seller.max_listing_cents = 4, 25_000
+        elif seller.completed_buys >= 3 and seller.successful_sales >= 3:
+            seller.seller_tier, seller.max_listing_cents = 3, 20_000
+        elif seller.completed_buys >= 1 or seller.successful_sales >= 1:
+            seller.seller_tier, seller.max_listing_cents = 2, 10_000
+
+    def complete_due_order(self, order_id, now=None):
+        now = now or utc_now()
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None:
+                return None
+            if order.status == "completed":
+                return self._order_dict(order)
+            delivery_due = order.delivery_confirmation_due_at
+            hold_until = order.hold_until
+            if delivery_due is not None and delivery_due.tzinfo is None:
+                delivery_due = delivery_due.replace(tzinfo=timezone.utc)
+            if hold_until is not None and hold_until.tzinfo is None:
+                hold_until = hold_until.replace(tzinfo=timezone.utc)
+            shipment_expired = order.status == "shipped" and delivery_due and delivery_due <= now
+            protection_expired = order.status == "protection_hold" and hold_until and hold_until <= now
+            if not (shipment_expired or protection_expired):
+                return None
+            self._complete_locked_order(session, order, now)
+            return self._order_dict(order)
+
+    def begin_due_return_refund(self, order_id, now=None):
+        now = now or utc_now()
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None:
+                return None
+            if order.status == "refund_pending" and order.return_reason:
+                return self._order_dict(order)
+            due = order.return_confirmation_due_at
+            if due is not None and due.tzinfo is None:
+                due = due.replace(tzinfo=timezone.utc)
+            if order.status != "return_shipped" or not due or due > now:
+                return None
+            order.status = "refund_pending"
+            order.return_received_at = order.return_received_at or now
+            order.updated_at = now
             return self._order_dict(order)
 
     def list_return_disputes(self):
@@ -1213,19 +1355,5 @@ class Database:
                 hold_until = hold_until.replace(tzinfo=timezone.utc)
             if order.status != "protection_hold" or not hold_until or hold_until > utc_now():
                 raise ListingValidationError("The 10-day buyer-protection period has not ended.")
-            order.status = "completed"
-            order.completed_at = utc_now()
-            buyer, seller = session.get(User, order.buyer_id), session.get(User, order.seller_id)
-            buyer.completed_buys += 1
-            seller.successful_sales += 1
-            if order.item_cents >= 10_000:
-                seller.successful_sales_over_100 += 1
-            if seller.successful_sales_over_100 >= 5:
-                seller.seller_tier, seller.max_listing_cents = 5, 100_000
-            elif seller.completed_buys >= 5 and seller.successful_sales >= 5:
-                seller.seller_tier, seller.max_listing_cents = 4, 25_000
-            elif seller.completed_buys >= 3 and seller.successful_sales >= 3:
-                seller.seller_tier, seller.max_listing_cents = 3, 20_000
-            elif seller.completed_buys >= 1 or seller.successful_sales >= 1:
-                seller.seller_tier, seller.max_listing_cents = 2, 10_000
+            self._complete_locked_order(session, order, utc_now())
             return self._order_dict(order)

@@ -1,6 +1,6 @@
-# PokeMarket Backend 2.13.0 — beta control center
+# PokeMarket Backend 2.14.0 — automatic settlement safeguards
 
-Read `UPDATE-2.13.0.md` for this release's deployment notes. The older update
+Read `UPDATE-2.14.0.md` for this release's deployment notes. The older update
 files remain as a history of the account, publishing, cloud-photo, and deletion
 changes that are already included here.
 
@@ -79,12 +79,15 @@ Checkout and orders:
   `checkout.session.completed` event. Configure `STRIPE_WEBHOOK_SECRET` from
   the Stripe Dashboard webhook endpoint.
 - `GET /api/v1/orders` and `GET /api/v1/orders/{id}` show buyer/seller orders.
-- Sellers can add tracking; buyers confirm delivery; completion is blocked
-  until the 10-day protection hold ends. Only then is the seller transfer
-  created and the seller's trust-tier counters updated.
-- Buyers can request a return during the protection window. Approval, return
-  tracking, receipt confirmation, Stripe refund, dispute escalation, and
-  automatic restoration of the returned card to a private draft are included.
+- Sellers add outbound tracking and the backend stores a durable 10-day buyer
+  confirmation deadline. A buyer may confirm delivery or request a return during
+  that window. If neither happens, the backend completes the order and releases
+  the seller payout automatically. A manually confirmed delivery still receives
+  the 10-day protection hold, which is also completed automatically at expiry.
+- Buyers can request a return during the protection window. When return tracking
+  is added, the backend stores a durable 10-day seller confirmation deadline. If
+  the seller does not confirm receipt, the backend confirms it and issues the
+  Stripe refund automatically. The returned card is restored to a private draft.
 - Firebase notifications cover sales, shipping, delivery, returns, refunds,
   completed orders, and administrator seller-tier changes.
 - Administrators can list users, manually set seller tiers, and resolve return
@@ -125,6 +128,8 @@ STRIPE_SECRET_KEY=sk_test_<your Stripe test secret>
 STRIPE_PUBLISHABLE_KEY=pk_test_<your Stripe test publishable key>
 STRIPE_WEBHOOK_SECRET=whsec_<your Stripe test webhook signing secret>
 ADMIN_EMAILS=<your signed-in PokeMarket email>
+CONFIRMATION_TIMEOUT_DAYS=10
+SETTLEMENT_WORKER_POLL_SECONDS=60
 FIREBASE_PROJECT_ID=<your Firebase project ID>
 FIREBASE_SERVICE_ACCOUNT_JSON=<single-line Firebase service-account JSON>
 
@@ -136,13 +141,14 @@ Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
 After deployment, `/api/v1/health` should include version
-`2.13.0-beta-control`, `database:"connected"`, `auth:"configured"`,
+`2.14.0-auto-settlement`, `database:"connected"`, `auth:"configured"`,
 `payments:"configured"`, and `push_notifications:"configured"` when Firebase
 is configured.
 
-At startup, SQLAlchemy safely adds the order shipping-address and payout fields
-used by this release, the return fields, administrator flag, notification-token
-table, and Gemini retry timestamp. Add Alembic migrations before later
-production schema changes.
+At startup, SQLAlchemy safely adds the persistent purchase/return confirmation
+deadlines and backfills existing shipped orders without resetting their clocks.
+While Render is awake, the settlement worker checks every 60 seconds. A sleeping
+free instance processes overdue settlements immediately after its next wake-up.
+Add Alembic migrations before later production schema changes.
 
 Do not upload .pyc files, __pycache__, download, or download (1).

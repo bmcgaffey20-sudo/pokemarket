@@ -242,6 +242,95 @@ def test_return_lifecycle_holds_payout_refunds_and_restores_draft(market):
     assert db.get_listing("card", "seller")["status"] == "draft"
 
 
+def test_ten_day_timeouts_auto_pay_seller_and_refund_buyer(market, monkeypatch):
+    client, db, _, _ = market
+    db.set_stripe_account("seller", "acct_auto")
+
+    class FakeTransfer:
+        calls = []
+
+        @classmethod
+        def create(cls, **kwargs):
+            cls.calls.append(kwargs)
+            return {"id": "tr_auto"}
+
+    class FakeRefund:
+        calls = []
+
+        @classmethod
+        def create(cls, **kwargs):
+            cls.calls.append(kwargs)
+            return {"id": "re_auto"}
+
+    class FakeStripe:
+        Transfer = FakeTransfer
+        Refund = FakeRefund
+
+    monkeypatch.setattr(main, "require_stripe", lambda: FakeStripe())
+
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    purchase = db.create_pending_order("order-auto-payout", "card", "other", 4)
+    db.attach_checkout_session(purchase["id"], "cs_auto_payout")
+    db.claim_order_payment("cs_auto_payout", "pi_auto_payout")
+    shipped = db.set_tracking(purchase["id"], "seller", "OUTBOUND-AUTO", 10)
+    assert shipped["delivery_confirmation_due_at"] is not None
+    with db.sessions.begin() as session:
+        session.get(Order, purchase["id"]).delivery_confirmation_due_at = utc_now() - timedelta(seconds=1)
+
+    asyncio.run(main.process_due_settlements(db))
+
+    completed = db.get_order(purchase["id"], "other")
+    assert completed["status"] == "completed"
+    assert completed["payout_status"] == "paid"
+    assert completed["stripe_transfer_id"] == "tr_auto"
+    assert FakeTransfer.calls[0]["idempotency_key"] == "pokemarket-order-payout-order-auto-payout"
+
+    return_listing_id = "return-timeout-card"
+    db.upsert_listing(
+        return_listing_id,
+        dict(
+            title="Return timeout card",
+            description="Condition disclosure",
+            price_cents=1250,
+            currency="USD",
+            card_name="Return card",
+            estimated_condition="Near Mint",
+            status="draft",
+        ),
+        "seller",
+    )
+    return_images = [
+        dict(
+            label="required_" + label,
+            object_key=f"listings/{return_listing_id}/{label}",
+            content_type="image/jpeg",
+            size_bytes=100,
+        )
+        for label in ("front_straight", "front_slight_left", "front_slight_right", "back")
+    ]
+    db.replace_images(return_listing_id, return_images, "seller")
+    db.set_publication(return_listing_id, "seller", True)
+    returned = db.create_pending_order("order-auto-refund", return_listing_id, "other", 4)
+    db.attach_checkout_session(returned["id"], "cs_auto_refund")
+    db.claim_order_payment("cs_auto_refund", "pi_auto_refund")
+    db.set_tracking(returned["id"], "seller", "OUTBOUND-RETURN", 10)
+    requested = db.request_return(returned["id"], "other", "not_as_described", "Test timeout")
+    assert requested["status"] == "return_requested"
+    db.review_return(returned["id"], "seller", True)
+    return_shipped = db.set_return_tracking(returned["id"], "other", "RETURN-AUTO", 10)
+    assert return_shipped["return_confirmation_due_at"] is not None
+    with db.sessions.begin() as session:
+        session.get(Order, returned["id"]).return_confirmation_due_at = utc_now() - timedelta(seconds=1)
+
+    asyncio.run(main.process_due_settlements(db))
+
+    refunded = db.get_order(returned["id"], "other")
+    assert refunded["status"] == "refunded"
+    assert refunded["stripe_refund_id"] == "re_auto"
+    assert db.get_listing(return_listing_id, "seller")["status"] == "draft"
+    assert FakeRefund.calls[0]["idempotency_key"] == "pokemarket-return-order-auto-refund"
+
+
 def test_admin_can_list_users_and_override_seller_tier(market):
     _, db, _, _ = market
     admin = db.set_admin("seller", True)
