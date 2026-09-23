@@ -1005,7 +1005,22 @@ class Database:
             if listing_id is not None:
                 statement = statement.where(Listing.id == listing_id)
             if query.strip():
-                statement = statement.where(Listing.title.icontains(query.strip(), autoescape=True))
+                term = query.strip()
+                statement = statement.where(or_(
+                    Listing.title.icontains(term, autoescape=True),
+                    Listing.card_name.icontains(term, autoescape=True),
+                    Listing.set_name.icontains(term, autoescape=True),
+                    Listing.card_number.icontains(term, autoescape=True),
+                ))
+            # A new marketplace has no view history; show published listings
+            # until the first genuine detail view establishes a ranking.
+            if top_viewed:
+                viewed = session.scalar(select(Listing.id).where(
+                    Listing.status == "published", Listing.publication_approved.is_(True),
+                    Listing.view_count > 0,
+                ).limit(1))
+                if viewed is not None:
+                    statement = statement.where(Listing.view_count > 0)
             ordering = (Listing.view_count.desc(), Listing.updated_at.desc(), Listing.id) if top_viewed else (Listing.updated_at.desc(), Listing.id)
             rows = session.execute(statement.order_by(*ordering).limit(limit).offset(offset)).all()
             results = []
@@ -1013,6 +1028,11 @@ class Database:
                 record = self._listing_dict(listing)
                 # Explicit public allowlist: no email, scan payload, local notes or credentials.
                 public = {key: record[key] for key in ("id", "title", "description", "price_cents", "currency", "card_name", "set_name", "card_number", "estimated_condition", "rarity_tier", "view_count", "updated_at", "images")}
+                ai = listing.ai_result if isinstance(listing.ai_result, dict) else {}
+                verified = ai.get("tcgdex") if isinstance(ai.get("tcgdex"), dict) else {}
+                identified = ai.get("identification") if isinstance(ai.get("identification"), dict) else {}
+                types = verified.get("types")
+                public["card_type"] = (types[0] if isinstance(types, list) and types and isinstance(types[0], str) else identified.get("card_type"))
                 public["seller"] = {"display_name": seller.display_name, "tier": seller.seller_tier}
                 results.append(public)
             return results

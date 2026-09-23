@@ -15,6 +15,7 @@ IDENTIFICATION_SCHEMA = {
         "number": {"type": ["string", "null"]},
         "language": {"type": ["string", "null"]},
         "variant": {"type": ["string", "null"]},
+        "card_type": {"type": ["string", "null"]},
         "rarity": {
             "type": "string",
             "enum": [
@@ -32,6 +33,7 @@ IDENTIFICATION_SCHEMA = {
         "number",
         "language",
         "variant",
+        "card_type",
         "rarity",
         "tcgdex_id",
         "confidence",
@@ -132,6 +134,8 @@ Identify:
 - collector/card number
 - language
 - variant
+- printed Pokémon type (Fire, Lightning, Water, Grass, Psychic, Fighting,
+  Darkness, Metal, Dragon, Colorless, or Fairy); null if not visible
 - printed rarity tier: rare, double rare, ultra rare, illustration rare,
   special illustration rare, or hyper illustration rare
 - exact TCGdex ID ONLY when highly confident
@@ -198,6 +202,7 @@ condition and preliminary authenticity screening in the same response.
 
 Identification:
 - Read the card name, set, collector number, language and variant carefully.
+- Identify the printed Pokémon type, or use null when it cannot be confirmed.
 - Classify its printed rarity as rare, double rare, ultra rare, illustration
   rare, special illustration rare, or hyper illustration rare. Use the card's
   printed/set evidence, not market value. When evidence is inconclusive, use rare.
@@ -238,6 +243,7 @@ class StubProvider:
             "number": None,
             "language": None,
             "variant": None,
+            "card_type": None,
             "rarity": "rare",
             "tcgdex_id": None,
             "confidence": 0.0,

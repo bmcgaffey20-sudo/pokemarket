@@ -1,6 +1,6 @@
-# PokeMarket Backend 2.16.0 — viewed listings and rarity tiers
+# PokeMarket Backend 2.17.0 — popular home feed and card types
 
-Read `UPDATE-2.16.0.md` for this release's deployment notes. The older update
+Read `UPDATE-2.17.0.md` for this release's deployment notes. The older update
 files remain as a history of the account, publishing, cloud-photo, and deletion
 changes that are already included here.
 
@@ -159,7 +159,7 @@ Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
 After deployment, `/api/v1/health` should include version
-`2.16.0-viewed-rarity`, `database:"connected"`, `auth:"configured"`,
+`2.17.0-popular-home`, `database:"connected"`, `auth:"configured"`,
 `payments:"configured"`, and `push_notifications:"configured"` when Firebase
 is configured.
 

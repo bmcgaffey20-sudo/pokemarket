@@ -84,7 +84,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.16.0-viewed-rarity")
+app = FastAPI(title=settings.app_name, version="2.17.0-popular-home")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -247,7 +247,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.16.0-viewed-rarity",
+        version="2.17.0-popular-home",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -434,7 +434,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.16.0-viewed-rarity",
+        "service_version": "2.17.0-popular-home",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -702,6 +702,9 @@ async def perform_scan_analysis(
         verified_id = match.get("id")
         if verified_id:
             identification["tcgdex_verified_id"] = verified_id
+        types = match.get("types")
+        if isinstance(types, list) and types and isinstance(types[0], str):
+            identification["card_type"] = types[0]
     else:
         warnings.append(
             "No sufficiently strong TCGdex match was established."
@@ -1202,7 +1205,7 @@ async def browse_marketplace(limit: int = 20, offset: int = 0, q: str = "", data
 
 
 @app.get("/api/v1/marketplace/top")
-async def top_viewed_marketplace(limit: int = 10, database=Depends(require_database)):
+async def top_viewed_marketplace(limit: int = 20, database=Depends(require_database)):
     if not 1 <= limit <= 25:
         raise HTTPException(400, "limit must be between 1 and 25.")
     records = await asyncio.to_thread(database.marketplace, limit, 0, "", None, True)

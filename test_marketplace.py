@@ -43,6 +43,7 @@ def test_publish_browse_withdraw_and_privacy(market):
     assert client.get("/api/v1/marketplace/card").status_code == 404
     assert client.post("/api/v1/listings/card/publish").status_code == 200
     assert client.post("/api/v1/listings/card/publish").status_code == 200
+    assert client.get("/api/v1/marketplace/top?limit=20").json()[0]["view_count"] == 0
     public = client.get("/api/v1/marketplace/card").json()
     assert public["title"] == "Dracozolt VMAX"
     assert public["seller"] == {"display_name": "Seller", "tier": 1}
@@ -50,18 +51,38 @@ def test_publish_browse_withdraw_and_privacy(market):
     assert set(public["images"][0]) == {"label", "url"}
     assert public["view_count"] == 1
     assert public["rarity_tier"] == "rare"
+    assert public["card_type"] is None
     assert client.get("/api/v1/marketplace/card").json()["view_count"] == 1
     assert client.get("/api/v1/marketplace/card", headers={"User-Agent": "second-viewer"}).json()["view_count"] == 2
     assert client.get("/api/v1/marketplace/card", headers={"X-PokeMarket-Viewer": "install-one"}).json()["view_count"] == 3
     assert client.get("/api/v1/marketplace/card", headers={"X-PokeMarket-Viewer": "install-one"}).json()["view_count"] == 3
     assert client.get("/api/v1/marketplace/top?limit=10").json()[0]["id"] == "card"
     assert len(client.get("/api/v1/marketplace?q=dracozolt").json()) == 1
+    assert len(client.get("/api/v1/marketplace?q=dracozolt&limit=20").json()) == 1
     assert client.get("/api/v1/marketplace?q=missing").json() == []
     assert client.get("/api/v1/marketplace?offset=1").json() == []
     assert client.get("/api/v1/marketplace?limit=1000").status_code == 400
     assert client.post("/api/v1/listings/card/unpublish").status_code == 200
     assert client.get("/api/v1/marketplace/card").status_code == 404
     assert len(db.get_listing("card", "seller")["images"]) == 4
+
+
+def test_top_viewed_hides_unviewed_and_exposes_verified_type(market):
+    client, db, _, images = market
+    db.upsert_listing("card", {"set_name": "Obsidian Flames", "ai_result": {
+        "identification": {"card_type": "Water"},
+        "tcgdex": {"types": ["Fire"]},
+    }}, "seller")
+    db.upsert_listing("second", dict(title="Other", description="Condition disclosure", price_cents=1350, currency="USD", card_name="Other", estimated_condition="Near Mint", status="draft"), "seller")
+    db.replace_images("second", [dict(image, object_key=image["object_key"].replace("card", "second")) for image in images], "seller")
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    assert client.post("/api/v1/listings/second/publish").status_code == 200
+    assert len(client.get("/api/v1/marketplace/top?limit=20").json()) == 2
+    assert client.get("/api/v1/marketplace/card").json()["card_type"] == "Fire"
+    ranked = client.get("/api/v1/marketplace/top?limit=20").json()
+    assert [listing["id"] for listing in ranked] == ["card"]
+    assert ranked[0]["card_type"] == "Fire"
+    assert [item["id"] for item in client.get("/api/v1/marketplace?q=Obsidian").json()] == ["card"]
 
 
 @pytest.mark.parametrize("field,value", [("title", "  "), ("description", ""), ("card_name", None), ("estimated_condition", ""), ("price_cents", 0), ("price_cents", 8001), ("currency", "EUR")])
