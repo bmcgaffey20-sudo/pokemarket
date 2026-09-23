@@ -240,6 +240,11 @@ def scan_configuration(market="pokemon", grading_status="ungraded"):
     schema = deepcopy(COMBINED_SCAN_SCHEMA)
     identity = schema["properties"]["identification"]
     extra = ["grading_company", "grade", "certification_number"]
+    if market == "magic":
+        identity["properties"]["mana_colors"] = {
+            "type": "array", "items": {"type": "string", "enum": ["W", "U", "B", "R", "G", "C"]}
+        }
+        identity["required"].append("mana_colors")
     if market == "sports":
         extra += ["sport", "player", "team", "year", "manufacturer", "parallel", "serial_number"]
     for field in extra:
@@ -250,7 +255,7 @@ def scan_configuration(market="pokemon", grading_status="ungraded"):
         identity["properties"]["rarity"] = {"type": ["string", "null"]}
         focus = (
             "Identify this Magic: The Gathering card: name, set, collector number, language, "
-            "foil/printing variant, printed rarity and card type. Do not apply Pokémon rarity or energy types."
+            "foil/printing variant, printed rarity and card type. Return mana_colors from visible card color evidence as W (white), U (blue), B (black), R (red), G (green), or C (colorless); include all colors for multicolor cards and an empty array when uncertain. Do not infer colors from illustration colors. Do not apply Pokémon rarity or energy types."
             if market == "magic" else
             "Identify this sports trading card: athlete/player, sport, team, year, manufacturer, set, "
             "card number, parallel and visible serial number. Use the athlete/card title as name. "

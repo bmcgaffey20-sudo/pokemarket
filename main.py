@@ -77,6 +77,7 @@ from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
 from recovery import install_recovery, limit_auth, send_action_email
 from tracking import TrackingValidationError, classify_tracking_number
+from community import install_community, cleanup_message_uploads
 
 
 settings = get_settings()
@@ -85,7 +86,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.18.3-carrier-tracking")
+app = FastAPI(title=settings.app_name, version="2.19.0-feedback-messages")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -100,7 +101,7 @@ async def safe_validation_error(request: Request, exc):
 @app.middleware("http")
 async def private_account_responses(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith(("/api/v1/auth/", "/api/v1/admin/", "/api/v1/account/", "/account/")):
+    if request.url.path.startswith(("/api/v1/auth/", "/api/v1/admin/", "/api/v1/account/", "/api/v1/messages", "/api/v1/orders", "/account/")):
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
     return response
@@ -248,7 +249,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.18.3-carrier-tracking",
+        version="2.19.0-feedback-messages",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -435,7 +436,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.18.3-carrier-tracking",
+        "service_version": "2.19.0-feedback-messages",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -448,6 +449,7 @@ async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(requ
 
 
 install_recovery(app, settings, require_database, require_user)
+install_community(app, settings, require_database, require_user, lambda: get_r2_storage())
 
 
 @app.get("/api/v1/cards/search", response_model=CardSearchResponse)
@@ -899,6 +901,7 @@ async def process_operational_safeguards(database):
 
     await asyncio.to_thread(database.redact_expired_sale_addresses, settings.sale_detail_retention_days)
     await asyncio.to_thread(database.prune_listing_view_deduplication, 90)
+    await asyncio.to_thread(cleanup_message_uploads, database, settings, get_r2_storage)
 
 async def settlement_worker_loop():
     deadlines_ready = False

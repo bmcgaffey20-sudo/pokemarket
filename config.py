@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     access_token_ttl_seconds: int = 2_592_000
     password_hash_iterations: int = 600_000
     r2_bucket_name: str | None = None
+    r2_message_bucket_name: str | None = None
     r2_endpoint: str | None = None
     r2_access_key_id: str | None = None
     r2_secret_access_key: str | None = None

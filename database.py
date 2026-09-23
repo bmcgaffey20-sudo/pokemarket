@@ -1081,6 +1081,8 @@ class Database:
                 ai = listing.ai_result if isinstance(listing.ai_result, dict) else {}
                 verified = ai.get("tcgdex") if isinstance(ai.get("tcgdex"), dict) else {}
                 identified = ai.get("identification") if isinstance(ai.get("identification"), dict) else {}
+                colors = identified.get("mana_colors")
+                public["mana_colors"] = [c for c in colors if c in ("W", "U", "B", "R", "G", "C")] if isinstance(colors, list) else []
                 public["market_rarity"] = identified.get("rarity") if listing.market != "pokemon" else listing.rarity_tier
                 types = verified.get("types")
                 public["card_type"] = (types[0] if isinstance(types, list) and types and isinstance(types[0], str) else identified.get("card_type"))
