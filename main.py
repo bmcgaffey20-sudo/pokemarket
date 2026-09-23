@@ -85,7 +85,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.18.2-four-views")
+app = FastAPI(title=settings.app_name, version="2.18.3-carrier-tracking")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -248,7 +248,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.18.2-four-views",
+        version="2.18.3-carrier-tracking",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -435,7 +435,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.18.2-four-views",
+        "service_version": "2.18.3-carrier-tracking",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -1767,7 +1767,7 @@ async def add_order_tracking(order_id: str, payload: TrackingRequest, background
     if visible is None or visible["seller_id"] != current_user["id"]:
         raise HTTPException(404, "Order not found.")
     try:
-        tracking_number, carrier = classify_tracking_number(payload.tracking_number)
+        tracking_number, carrier = classify_tracking_number(payload.tracking_number, payload.carrier)
         order = await asyncio.to_thread(
             database.set_tracking,
             order_id,
@@ -1828,7 +1828,7 @@ async def add_return_tracking(order_id: str, payload: TrackingRequest, backgroun
     if visible is None or visible["buyer_id"] != current_user["id"]:
         raise HTTPException(404, "Order not found.")
     try:
-        tracking_number, carrier = classify_tracking_number(payload.tracking_number)
+        tracking_number, carrier = classify_tracking_number(payload.tracking_number, payload.carrier)
         order = await asyncio.to_thread(
             database.set_return_tracking,
             order_id,

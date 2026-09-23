@@ -541,3 +541,29 @@ def test_front_and_back_alone_cannot_publish(market):
     assert client.post("/api/v1/listings/card/publish").status_code == 422
     db.replace_images("card", images, "seller")
     assert client.post("/api/v1/listings/card/publish").status_code == 200
+
+
+def test_explicit_carrier_resolves_ambiguous_tracking():
+    number = "12345678901234567890"
+    assert classify_tracking_number(number, "FedEx") == (number, "FedEx")
+    assert classify_tracking_number(number, "USPS") == (number, "USPS")
+    with pytest.raises(TrackingValidationError):
+        classify_tracking_number("1Z999AA10123456784", "USPS")
+
+
+def test_carrier_mismatch_does_not_mark_order_shipped(market):
+    client, db, _, _ = market
+    client.post("/api/v1/listings/card/publish")
+    db.create_pending_order("carrier-test", "card", "other", 4)
+    db.attach_checkout_session("carrier-test", "cs_carrier")
+    db.claim_order_payment("cs_carrier", "pi_carrier")
+    response = client.post("/api/v1/orders/carrier-test/tracking", json={
+        "tracking_number": "1Z999AA10123456784", "carrier": "USPS",
+    })
+    assert response.status_code == 409
+    assert db.get_order("carrier-test", "seller")["status"] == "paid"
+    response = client.post("/api/v1/orders/carrier-test/tracking", json={
+        "tracking_number": "1Z999AA10123456784", "carrier": "UPS",
+    })
+    assert response.status_code == 200
+    assert response.json()["tracking_carrier"] == "UPS"

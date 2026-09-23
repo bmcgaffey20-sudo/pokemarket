@@ -144,6 +144,7 @@ class OrderResponse(BaseModel):
 
 class TrackingRequest(BaseModel):
     tracking_number: str = Field(min_length=3, max_length=128)
+    carrier: Literal["USPS", "UPS", "FedEx"] | None = None
 
 class SellerAddressRequest(BaseModel):
     name: str = Field(min_length=1, max_length=160)
