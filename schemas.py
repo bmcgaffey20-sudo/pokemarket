@@ -259,7 +259,7 @@ class DirectUploadItemRequest(BaseModel):
     size_bytes: int = Field(gt=0, le=12_000_000)
 
 class DirectUploadSessionRequest(BaseModel):
-    images: list[DirectUploadItemRequest] = Field(min_length=4, max_length=9)
+    images: list[DirectUploadItemRequest] = Field(min_length=2, max_length=9)
 
 class DirectUploadTarget(BaseModel):
     label: str
@@ -282,7 +282,7 @@ class DirectUploadCompleteItem(BaseModel):
 
 class DirectUploadCompleteRequest(BaseModel):
     upload_id: str = Field(min_length=32, max_length=32)
-    images: list[DirectUploadCompleteItem] = Field(min_length=4, max_length=9)
+    images: list[DirectUploadCompleteItem] = Field(min_length=2, max_length=9)
 
 class ListingUpsertRequest(BaseModel):
     market: Market = "pokemon"

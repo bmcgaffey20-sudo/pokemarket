@@ -85,7 +85,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.18.0-multi-market")
+app = FastAPI(title=settings.app_name, version="2.18.1-two-photo")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -248,7 +248,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.18.0-multi-market",
+        version="2.18.1-two-photo",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -435,7 +435,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.18.0-multi-market",
+        "service_version": "2.18.1-two-photo",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -518,22 +518,18 @@ async def read_images(files, forced_labels=None):
 
 def validate_image_labels(labels):
     """Apply the same evidence contract to multipart and direct uploads."""
-    required = {
-        "required_front_straight",
-        "required_front_slight_left",
-        "required_front_slight_right",
-        "required_back",
-    }
-    supplied_required = [label for label in labels if label in required]
-    if set(supplied_required) != required or len(supplied_required) != 4:
-        raise HTTPException(
-            400,
-            "Exactly one best photo for each required angle is needed: "
-            "straight, slight left, slight right, and back.",
-        )
+    required = {"required_front_straight", "required_back"}
+    optional_angles = {"required_front_slight_left", "required_front_slight_right"}
+    if len(labels) != len(set(labels)):
+        raise HTTPException(400, "Each photo label must be unique.")
+    if not required.issubset(labels):
+        raise HTTPException(400, "One front photo and one back photo are required.")
     defect_count = sum(label.startswith("defect_") for label in labels)
-    if defect_count > 5 or len(labels) != 4 + defect_count:
-        raise HTTPException(400, "Send only the four required views and up to five defect close-ups.")
+    if defect_count > 5 or any(
+        label not in required | optional_angles and not label.startswith("defect_")
+        for label in labels
+    ):
+        raise HTTPException(400, "Send front and back photos, optional side angles, and up to five defect close-ups.")
 
 
 def as_plain_dict(value):
@@ -1338,8 +1334,8 @@ async def read_listings(
 async def upload_listing_images(
     listing_id: str,
     front_straight: UploadFile = File(...),
-    front_slight_left: UploadFile = File(...),
-    front_slight_right: UploadFile = File(...),
+    front_slight_left: UploadFile | None = File(None),
+    front_slight_right: UploadFile | None = File(None),
     back: UploadFile = File(...),
     current_user=Depends(require_user),
     database=Depends(require_database),
@@ -1351,6 +1347,9 @@ async def upload_listing_images(
         "required_front_slight_right",
         "required_back",
     ]
+    present = [(file, label) for file, label in zip(files, labels) if file is not None]
+    files = [file for file, _ in present]
+    labels = [label for _, label in present]
     return await persist_images(
         listing_id,
         files,

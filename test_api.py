@@ -17,7 +17,7 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.18.0-multi-market"
+    assert r.json()["version"] == "2.18.1-two-photo"
     assert r.json()["database"] in {"not_configured", "connected"}
     assert r.json()["auth"] in {"not_configured", "configured"}
 
@@ -431,3 +431,31 @@ def test_accounts_scope_listing_queries_and_first_user_claims_legacy(tmp_path):
         settings.auth_secret = old_secret
         settings.password_hash_iterations = old_iterations
         settings.legacy_claim_code = old_claim_code
+
+@pytest.mark.parametrize("labels", [
+    ["required_front_straight", "required_back"],
+    ["required_front_straight", "required_back", "defect_crease_1"],
+    ["required_front_straight", "required_front_slight_left", "required_front_slight_right", "required_back"],
+])
+def test_two_photo_and_legacy_evidence_accepted(labels):
+    from main import validate_image_labels
+    from schemas import DirectUploadSessionRequest
+    validate_image_labels(labels)
+    request = DirectUploadSessionRequest(images=[
+        {"label": label, "content_type": "image/jpeg", "size_bytes": 100} for label in labels
+    ])
+    assert len(request.images) == len(labels)
+
+
+@pytest.mark.parametrize("labels", [
+    ["required_front_straight"],
+    ["required_back"],
+    ["required_front_straight", "required_front_straight", "required_back"],
+    ["required_front_straight", "required_back", "unknown"],
+    ["required_front_straight", "required_back"] + [f"defect_{i}" for i in range(6)],
+])
+def test_incomplete_or_invalid_two_photo_evidence_rejected(labels):
+    from main import validate_image_labels
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException):
+        validate_image_labels(labels)

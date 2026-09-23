@@ -1,6 +1,6 @@
-# PokeMarket Backend 2.18.0 — multi-market navigation and price tiers
+# PokeMarket Backend 2.18.1 — multi-market navigation and price tiers
 
-Read `UPDATE-2.18.0.md` for this release's deployment notes. The older update
+Read `UPDATE-2.18.1.md` for this release's deployment notes. The older update
 files remain as a history of the account, publishing, cloud-photo, and deletion
 changes that are already included here.
 
@@ -159,7 +159,7 @@ Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
 After deployment, `/api/v1/health` should include version
-`2.18.0-multi-market`, `database:"connected"`, `auth:"configured"`,
+`2.18.1-two-photo`, `database:"connected"`, `auth:"configured"`,
 `payments:"configured"`, and `push_notifications:"configured"` when Firebase
 is configured.
 

@@ -64,9 +64,9 @@ def validate_publication(listing, seller):
         raise ListingValidationError("Price exceeds your seller tier limit.")
     if not all((seller.seller_address_name, seller.seller_address_line1, seller.seller_address_city, seller.seller_address_state, seller.seller_address_postal_code)):
         raise ListingValidationError("Add your seller return address in Account before publishing.")
-    required = {"required_front_straight", "required_front_slight_left", "required_front_slight_right", "required_back"}
+    required = {"required_front_straight", "required_back"}
     if not listing.photos_persisted or not required.issubset({i.label for i in listing.images if i.size_bytes > 0 and i.object_key}):
-        raise ListingValidationError("Upload all four required card photos before publishing.")
+        raise ListingValidationError("Upload front and back card photos before publishing.")
 
 
 def utc_now():
