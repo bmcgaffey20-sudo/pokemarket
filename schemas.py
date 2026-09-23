@@ -96,6 +96,8 @@ class OrderResponse(BaseModel):
     stripe_checkout_session_id: str | None = None
     stripe_payment_intent_id: str | None = None
     tracking_number: str | None = None
+    tracking_carrier: str | None = None
+    tracking_status: str | None = None
     shipping_name: str | None = None
     shipping_line1: str | None = None
     shipping_line2: str | None = None
@@ -103,6 +105,13 @@ class OrderResponse(BaseModel):
     shipping_state: str | None = None
     shipping_postal_code: str | None = None
     shipping_country: str | None = None
+    seller_shipping_name: str | None = None
+    seller_shipping_line1: str | None = None
+    seller_shipping_line2: str | None = None
+    seller_shipping_city: str | None = None
+    seller_shipping_state: str | None = None
+    seller_shipping_postal_code: str | None = None
+    seller_shipping_country: str | None = None
     listing_title: str | None = None
     card_name: str | None = None
     set_name: str | None = None
@@ -119,15 +128,41 @@ class OrderResponse(BaseModel):
     return_reason: str | None = None
     return_notes: str | None = None
     return_tracking_number: str | None = None
+    return_tracking_carrier: str | None = None
+    return_tracking_status: str | None = None
     return_requested_at: datetime | None = None
     return_approved_at: datetime | None = None
     return_received_at: datetime | None = None
     return_confirmation_due_at: datetime | None = None
+    paid_at: datetime | None = None
+    pii_redacted_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
 class TrackingRequest(BaseModel):
     tracking_number: str = Field(min_length=3, max_length=128)
+
+class SellerAddressRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    line1: str = Field(min_length=1, max_length=200)
+    line2: str = Field(default="", max_length=200)
+    city: str = Field(min_length=1, max_length=120)
+    state: str = Field(min_length=1, max_length=120)
+    postal_code: str = Field(min_length=2, max_length=32)
+    country: str = Field(default="US", min_length=2, max_length=2)
+
+    @field_validator("name", "line1", "line2", "city", "state", "postal_code")
+    @classmethod
+    def normalize_address_text(cls, value):
+        return " ".join(value.split())
+
+    @field_validator("country")
+    @classmethod
+    def normalize_country(cls, value):
+        return value.strip().upper()
+
+class SellerAddressResponse(SellerAddressRequest):
+    configured: bool = True
 
 class ReturnRequest(BaseModel):
     reason: Literal["not_as_described", "damaged_in_transit", "authenticity_concern", "wrong_card", "other"]
@@ -287,6 +322,8 @@ class ListingResponse(BaseModel):
     tcgdex_id: str | None = None
     estimated_condition: str | None = None
     ai_result: dict[str, Any] | None = None
+    rarity_tier: str = "rare"
+    view_count: int = 0
     photos_persisted: bool
     created_at: datetime
     updated_at: datetime

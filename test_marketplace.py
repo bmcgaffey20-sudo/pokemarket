@@ -5,8 +5,10 @@ from datetime import timedelta
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 from auth import create_access_token
-from database import Database, Listing, Order, utc_now
+from database import Database, Listing, Order, normalize_rarity, rarity_from_ai_result, utc_now
 from main import app, require_database, require_user
+from reporting import build_sales_csv
+from tracking import TrackingValidationError, classify_tracking_number
 
 
 @pytest.fixture
@@ -15,6 +17,10 @@ def market(tmp_path, monkeypatch):
     database.initialize()
     user, _ = database.create_user("seller", "seller@example.com", "Seller", "hash", "salt", 10000)
     database.create_user("other", "other@example.com", "Other", "hash", "salt", 10000)
+    database.update_seller_address("seller", {
+        "name": "Seller", "line1": "1 Market Street", "line2": "", "city": "Pasco",
+        "state": "WA", "postal_code": "99301", "country": "US",
+    })
     app.dependency_overrides[require_database] = lambda: database
     app.dependency_overrides[require_user] = lambda: user
     class Storage:
@@ -42,6 +48,13 @@ def test_publish_browse_withdraw_and_privacy(market):
     assert public["seller"] == {"display_name": "Seller", "tier": 1}
     assert not {"seller_id", "scan_id", "ai_result", "email", "password_hash"} & public.keys()
     assert set(public["images"][0]) == {"label", "url"}
+    assert public["view_count"] == 1
+    assert public["rarity_tier"] == "rare"
+    assert client.get("/api/v1/marketplace/card").json()["view_count"] == 1
+    assert client.get("/api/v1/marketplace/card", headers={"User-Agent": "second-viewer"}).json()["view_count"] == 2
+    assert client.get("/api/v1/marketplace/card", headers={"X-PokeMarket-Viewer": "install-one"}).json()["view_count"] == 3
+    assert client.get("/api/v1/marketplace/card", headers={"X-PokeMarket-Viewer": "install-one"}).json()["view_count"] == 3
+    assert client.get("/api/v1/marketplace/top?limit=10").json()[0]["id"] == "card"
     assert len(client.get("/api/v1/marketplace?q=dracozolt").json()) == 1
     assert client.get("/api/v1/marketplace?q=missing").json() == []
     assert client.get("/api/v1/marketplace?offset=1").json() == []
@@ -383,3 +396,63 @@ def test_migration_preserves_drafts_and_requires_explicit_publish(tmp_path):
         assert listing.status == "draft"
         assert not listing.publication_approved
     db.engine.dispose()
+
+
+def test_tracking_validation_admin_sales_report_and_retention(market):
+    client, db, _, _ = market
+    assert classify_tracking_number("1Z 999 AA1 01 2345 6784") == ("1Z999AA10123456784", "UPS")
+    with pytest.raises(TrackingValidationError):
+        classify_tracking_number("made-up-tracking")
+
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    order = db.create_pending_order("order-admin-sale", "card", "other", 4, 250)
+    db.attach_checkout_session(order["id"], "cs_admin_sale")
+    db.claim_order_payment("cs_admin_sale", "pi_admin_sale")
+    db.save_shipping_details("cs_admin_sale", {"name": "Buyer", "address": {
+        "line1": "2 Buyer Way", "city": "Kennewick", "state": "WA", "postal_code": "99336", "country": "US"
+    }})
+    db.set_tracking(order["id"], "seller", "1Z999AA10123456784", "UPS", 10)
+
+    participant = db.get_order(order["id"], "other")
+    assert participant["seller_shipping_line1"] is None
+    sale = db.get_admin_sale(order["id"])
+    assert sale["buyer_email"] == "other@example.com"
+    assert sale["seller_email"] == "seller@example.com"
+    assert sale["seller_shipping_line1"] == "1 Market Street"
+    assert sale["tracking_carrier"] == "UPS"
+    assert sale["audit_events"]
+    assert b"buyer@example" not in build_sales_csv([sale])
+    assert b"other@example.com" in build_sales_csv([sale])
+
+    with db.sessions.begin() as session:
+        stored = session.get(Order, order["id"])
+        stored.paid_at = utc_now() - timedelta(days=31)
+    assert db.redact_expired_sale_addresses(30) == 1
+    redacted = db.get_admin_sale(order["id"])
+    assert redacted["shipping_line1"] is None
+    assert redacted["seller_shipping_line1"] is None
+    assert redacted["pii_redacted_at"] is not None
+    assert redacted["item_cents"] == 1250
+
+
+def test_rarity_normalization_uses_tcgdex_or_ai_labels():
+    assert normalize_rarity("Special Illustration Rare") == "special_illustration_rare"
+    assert normalize_rarity("Hyper Rare") == "hyper_illustration_rare"
+    assert rarity_from_ai_result({"tcgdex": {"rarity": "Ultra Rare"}}) == "ultra_rare"
+    assert rarity_from_ai_result({"identification": {"rarity": "Double Rare"}}) == "double_rare"
+
+
+def test_tracking_number_cannot_be_reused(market):
+    client, db, _, images = market
+    assert client.post("/api/v1/listings/card/publish").status_code == 200
+    first = db.create_pending_order("reuse-one", "card", "other", 4)
+    db.attach_checkout_session(first["id"], "cs_reuse_one"); db.claim_order_payment("cs_reuse_one", "pi_reuse_one")
+    db.set_tracking(first["id"], "seller", "1Z999AA10123456784", "UPS")
+
+    db.upsert_listing("card-two", dict(title="Second", description="Disclosure", price_cents=1000, currency="USD", card_name="Second", estimated_condition="NM", status="draft"), "seller")
+    db.replace_images("card-two", [{**image, "object_key": image["object_key"].replace("card/", "card-two/")} for image in images], "seller")
+    db.set_publication("card-two", "seller", True)
+    second = db.create_pending_order("reuse-two", "card-two", "other", 4)
+    db.attach_checkout_session(second["id"], "cs_reuse_two"); db.claim_order_payment("cs_reuse_two", "pi_reuse_two")
+    with pytest.raises(Exception, match="already attached"):
+        db.set_tracking(second["id"], "seller", "1Z999AA10123456784", "UPS")

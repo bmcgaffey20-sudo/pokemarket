@@ -47,6 +47,10 @@ services:
         sync: false
       - key: ADMIN_EMAILS
         sync: false
+      - key: ADMIN_REPORT_EMAIL
+        sync: false
+      - key: SALE_DETAIL_RETENTION_DAYS
+        value: "30"
       - key: CONFIRMATION_TIMEOUT_DAYS
         value: "10"
       - key: SETTLEMENT_WORKER_POLL_SECONDS

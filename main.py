@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import hashlib
 import hmac
 import logging
 import traceback
@@ -36,6 +37,7 @@ from database import (
     ListingOwnershipError,
     ListingValidationError,
     UserAlreadyExistsError,
+    normalize_rarity,
 )
 from schemas import (
     AuthResponse,
@@ -65,11 +67,15 @@ from schemas import (
     SellerTierUpdateRequest,
     DeviceTokenRequest,
     DeviceTokenResponse,
+    SellerAddressRequest,
+    SellerAddressResponse,
 )
 from notifications import send_push
+from reporting import completed_week, send_weekly_sales_report
 from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
 from recovery import install_recovery, limit_auth, send_action_email
+from tracking import TrackingValidationError, classify_tracking_number
 
 
 settings = get_settings()
@@ -78,7 +84,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.14.0-auto-settlement")
+app = FastAPI(title=settings.app_name, version="2.16.0-viewed-rarity")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -93,7 +99,7 @@ async def safe_validation_error(request: Request, exc):
 @app.middleware("http")
 async def private_account_responses(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith(("/api/v1/auth/", "/account/")):
+    if request.url.path.startswith(("/api/v1/auth/", "/api/v1/admin/", "/api/v1/account/", "/account/")):
         response.headers["Cache-Control"] = "no-store"
         response.headers["Referrer-Policy"] = "no-referrer"
     return response
@@ -241,7 +247,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.14.0-auto-settlement",
+        version="2.16.0-viewed-rarity",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -352,6 +358,22 @@ async def register_notification_device(
     )
 
 
+@app.get("/api/v1/account/seller-address", response_model=SellerAddressResponse)
+async def read_seller_address(current_user=Depends(require_user), database=Depends(require_database)):
+    address = await asyncio.to_thread(database.get_seller_address, current_user["id"])
+    if address is None:
+        raise HTTPException(404, "User not found.")
+    return address
+
+
+@app.put("/api/v1/account/seller-address", response_model=SellerAddressResponse)
+async def save_seller_address(payload: SellerAddressRequest, current_user=Depends(require_user), database=Depends(require_database)):
+    address = await asyncio.to_thread(database.update_seller_address, current_user["id"], payload.model_dump())
+    if address is None:
+        raise HTTPException(404, "User not found.")
+    return address
+
+
 @app.get("/api/v1/admin/users", response_model=list[UserResponse])
 async def admin_users(
     limit: int = 100,
@@ -391,6 +413,37 @@ async def admin_set_seller_tier(
 @app.get("/api/v1/admin/returns", response_model=list[OrderResponse])
 async def admin_return_disputes(_admin=Depends(require_admin), database=Depends(require_database)):
     return await asyncio.to_thread(database.list_return_disputes)
+
+
+@app.get("/api/v1/admin/sales")
+async def admin_sales(limit: int = 100, offset: int = 0, q: str = "", _admin=Depends(require_admin), database=Depends(require_database)):
+    if not 1 <= limit <= 200 or offset < 0:
+        raise HTTPException(400, "Invalid pagination.")
+    return await asyncio.to_thread(database.list_admin_sales, limit, offset, q[:200])
+
+
+@app.get("/api/v1/admin/sales/{order_id}")
+async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), database=Depends(require_database)):
+    sale = await asyncio.to_thread(database.get_admin_sale, order_id)
+    if sale is None:
+        raise HTTPException(404, "Sale not found.")
+    return sale
+
+
+@app.get("/api/v1/admin/diagnostics")
+async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
+    result = await asyncio.to_thread(database.admin_diagnostics)
+    result.update({
+        "service_version": "2.16.0-viewed-rarity",
+        "email_configured": settings.email_configured,
+        "push_configured": settings.firebase_configured,
+        "payments_configured": settings.stripe_configured,
+        "weekly_report_configured": bool(settings.email_configured and settings.admin_report_recipient),
+        "report_recipient": settings.admin_report_recipient or None,
+        "sale_detail_retention_days": settings.sale_detail_retention_days,
+        "confirmation_timeout_days": settings.confirmation_timeout_days,
+    })
+    return result
 
 
 install_recovery(app, settings, require_database, require_user)
@@ -654,6 +707,10 @@ async def perform_scan_analysis(
             "No sufficiently strong TCGdex match was established."
         )
 
+    identification["rarity"] = normalize_rarity(
+        (match or {}).get("rarity") or identification.get("rarity") or identification.get("variant")
+    )
+
     condition = apply_grading_safeguards(condition, images)
     authenticity["confidence"] = normalize_confidence(
         authenticity.get("confidence")
@@ -797,15 +854,32 @@ async def process_due_settlements(database):
                 if order.get("status") == "refunded"
                 else "The 10-day return deadline ended. Return receipt was confirmed and the buyer refund will retry automatically."
             )
-            await send_push(
-                settings,
-                database,
-                [order["buyer_id"], order["seller_id"]],
-                "Return automatically confirmed",
-                body,
-                {"page": "orders", "order_id": order["id"]},
-            )
+            await send_push(settings, database, [order["buyer_id"], order["seller_id"]], "Return automatically confirmed", body, {"page": "orders", "order_id": order["id"]})
 
+
+async def process_operational_safeguards(database):
+    reminders = await asyncio.to_thread(database.due_deadline_reminders)
+    labels = {
+        "delivery": ("Delivery confirmation deadline", "Confirm delivery or report a problem. The order will automatically complete when the deadline expires."),
+        "hold": ("Seller payout hold ending", "Buyer protection is ending. The seller payout will automatically release when the deadline expires unless a return is open."),
+        "return": ("Return confirmation deadline", "Confirm the returned card was received. The buyer will automatically be refunded when the deadline expires."),
+    }
+    for reminder in reminders:
+        title, body = labels[reminder["kind"]]
+        marked = await asyncio.to_thread(database.mark_deadline_reminder, reminder["order_id"], reminder["kind"], reminder["days"])
+        if marked:
+            await send_push(settings, database, [reminder["user_id"]], title, f"{reminder['days']} day reminder: {body}", {"page": "orders", "order_id": reminder["order_id"]})
+
+    if settings.email_configured and settings.admin_report_recipient:
+        period_start, period_end = completed_week()
+        sent = await asyncio.to_thread(database.report_already_sent, period_start, period_end)
+        if not sent:
+            rows = await asyncio.to_thread(database.list_admin_sales, 10_000, 0, "", period_start, period_end)
+            subject = await send_weekly_sales_report(settings, rows, period_start, period_end)
+            await asyncio.to_thread(database.record_report_sent, period_start, period_end, settings.admin_report_recipient, subject)
+
+    await asyncio.to_thread(database.redact_expired_sale_addresses, settings.sale_detail_retention_days)
+    await asyncio.to_thread(database.prune_listing_view_deduplication, 90)
 
 async def settlement_worker_loop():
     deadlines_ready = False
@@ -819,6 +893,7 @@ async def settlement_worker_loop():
                 )
                 deadlines_ready = True
             await process_due_settlements(database)
+            await process_operational_safeguards(database)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1126,8 +1201,25 @@ async def browse_marketplace(limit: int = 20, offset: int = 0, q: str = "", data
     return [public_image_urls(record) for record in records]
 
 
+@app.get("/api/v1/marketplace/top")
+async def top_viewed_marketplace(limit: int = 10, database=Depends(require_database)):
+    if not 1 <= limit <= 25:
+        raise HTTPException(400, "limit must be between 1 and 25.")
+    records = await asyncio.to_thread(database.marketplace, limit, 0, "", None, True)
+    return [public_image_urls(record) for record in records]
+
+
 @app.get("/api/v1/marketplace/{listing_id}")
-async def marketplace_detail(listing_id: str, database=Depends(require_database)):
+async def marketplace_detail(listing_id: str, request: Request, database=Depends(require_database)):
+    forwarded = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    remote = forwarded or (request.client.host if request.client else "unknown")
+    user_agent = request.headers.get("user-agent", "unknown")[:300]
+    install_key = request.headers.get("x-pokemarket-viewer", "").strip()[:128]
+    daily_source = f"app:{install_key}" if install_key else f"web:{remote}|{user_agent}"
+    viewer_hash = hashlib.sha256(daily_source.encode("utf-8")).hexdigest()
+    count = await asyncio.to_thread(database.increment_listing_view, listing_id, viewer_hash)
+    if count is None:
+        raise HTTPException(404, "This listing is no longer available.")
     records = await asyncio.to_thread(database.marketplace, listing_id=listing_id)
     if not records:
         raise HTTPException(404, "This listing is no longer available.")
@@ -1643,15 +1735,20 @@ async def read_order(order_id: str, current_user=Depends(require_user), database
 
 @app.post("/api/v1/orders/{order_id}/tracking", response_model=OrderResponse)
 async def add_order_tracking(order_id: str, payload: TrackingRequest, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
+    visible = await asyncio.to_thread(database.get_order, order_id, current_user["id"])
+    if visible is None or visible["seller_id"] != current_user["id"]:
+        raise HTTPException(404, "Order not found.")
     try:
+        tracking_number, carrier = classify_tracking_number(payload.tracking_number)
         order = await asyncio.to_thread(
             database.set_tracking,
             order_id,
             current_user["id"],
-            payload.tracking_number.strip(),
+            tracking_number,
+            carrier,
             settings.confirmation_timeout_days,
         )
-    except ListingValidationError as exc:
+    except (ListingValidationError, TrackingValidationError) as exc:
         raise HTTPException(409, str(exc)) from exc
     if order is None:
         raise HTTPException(404, "Order not found.")
@@ -1699,15 +1796,20 @@ async def review_order_return(order_id: str, payload: ReturnReviewRequest, backg
 
 @app.post("/api/v1/orders/{order_id}/returns/tracking", response_model=OrderResponse)
 async def add_return_tracking(order_id: str, payload: TrackingRequest, background: BackgroundTasks, current_user=Depends(require_user), database=Depends(require_database)):
+    visible = await asyncio.to_thread(database.get_order, order_id, current_user["id"])
+    if visible is None or visible["buyer_id"] != current_user["id"]:
+        raise HTTPException(404, "Order not found.")
     try:
+        tracking_number, carrier = classify_tracking_number(payload.tracking_number)
         order = await asyncio.to_thread(
             database.set_return_tracking,
             order_id,
             current_user["id"],
-            payload.tracking_number.strip(),
+            tracking_number,
+            carrier,
             settings.confirmation_timeout_days,
         )
-    except ListingValidationError as exc:
+    except (ListingValidationError, TrackingValidationError) as exc:
         raise HTTPException(409, str(exc)) from exc
     if order is None:
         raise HTTPException(404, "Order not found.")

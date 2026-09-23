@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import time
 
@@ -8,6 +8,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Date,
     ForeignKey,
     Integer,
     String,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     delete,
+    func,
     inspect,
     or_,
     select,
@@ -22,7 +24,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, aliased, mapped_column, relationship, sessionmaker
 
 
 class DatabaseConfigurationError(RuntimeError):
@@ -53,6 +55,8 @@ def validate_publication(listing, seller):
         raise ListingValidationError("Set a positive USD price before publishing.")
     if seller.max_listing_cents is not None and listing.price_cents > seller.max_listing_cents:
         raise ListingValidationError("Price exceeds your seller tier limit.")
+    if not all((seller.seller_address_name, seller.seller_address_line1, seller.seller_address_city, seller.seller_address_state, seller.seller_address_postal_code)):
+        raise ListingValidationError("Add your seller return address in Account before publishing.")
     required = {"required_front_straight", "required_front_slight_left", "required_front_slight_right", "required_back"}
     if not listing.photos_persisted or not required.issubset({i.label for i in listing.images if i.size_bytes > 0 and i.object_key}):
         raise ListingValidationError("Upload all four required card photos before publishing.")
@@ -60,6 +64,36 @@ def validate_publication(listing, seller):
 
 def utc_now():
     return datetime.now(timezone.utc)
+
+
+RARITY_TIERS = {
+    "rare", "double_rare", "ultra_rare", "illustration_rare",
+    "special_illustration_rare", "hyper_illustration_rare",
+}
+
+
+def normalize_rarity(value):
+    text_value = str(value or "").strip().lower().replace("-", " ").replace("_", " ")
+    text_value = " ".join(text_value.split())
+    if "special illustration" in text_value:
+        return "special_illustration_rare"
+    if "hyper illustration" in text_value or "hyper rare" in text_value:
+        return "hyper_illustration_rare"
+    if "illustration" in text_value:
+        return "illustration_rare"
+    if "double" in text_value:
+        return "double_rare"
+    if "ultra" in text_value:
+        return "ultra_rare"
+    return "rare"
+
+
+def rarity_from_ai_result(result):
+    if not isinstance(result, dict):
+        return "rare"
+    identification = result.get("identification") if isinstance(result.get("identification"), dict) else {}
+    tcgdex = result.get("tcgdex") if isinstance(result.get("tcgdex"), dict) else {}
+    return normalize_rarity(identification.get("rarity") or tcgdex.get("rarity") or result.get("rarity") or identification.get("variant"))
 
 
 def normalize_database_url(url):
@@ -97,6 +131,13 @@ class User(Base):
     max_listing_cents: Mapped[int | None] = mapped_column(Integer, default=8_000, nullable=True)
     stripe_account_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    seller_address_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    seller_address_line1: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    seller_address_line2: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    seller_address_city: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    seller_address_state: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    seller_address_postal_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    seller_address_country: Mapped[str | None] = mapped_column(String(2), nullable=True)
 
 
 class AccountAction(Base):
@@ -135,6 +176,8 @@ class Listing(Base):
     tcgdex_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     estimated_condition: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ai_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    rarity_tier: Mapped[str] = mapped_column(String(40), default="rare", server_default="rare", nullable=False, index=True)
+    view_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False, index=True)
     photos_persisted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -170,6 +213,16 @@ class ListingImage(Base):
     listing: Mapped[Listing] = relationship(back_populates="images")
 
 
+class ListingView(Base):
+    __tablename__ = "listing_views"
+    __table_args__ = (UniqueConstraint("listing_id", "viewer_hash", "viewed_on", name="uq_listing_daily_view"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    listing_id: Mapped[str] = mapped_column(String(64), ForeignKey("listings.id", ondelete="CASCADE"), index=True)
+    viewer_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    viewed_on: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (UniqueConstraint("stripe_checkout_session_id", name="uq_order_checkout_session"),)
@@ -187,6 +240,8 @@ class Order(Base):
     stripe_checkout_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     stripe_payment_intent_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     tracking_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    tracking_carrier: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tracking_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     shipping_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
     shipping_line1: Mapped[str | None] = mapped_column(String(200), nullable=True)
     shipping_line2: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -194,6 +249,13 @@ class Order(Base):
     shipping_state: Mapped[str | None] = mapped_column(String(120), nullable=True)
     shipping_postal_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
     shipping_country: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    seller_shipping_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    seller_shipping_line1: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    seller_shipping_line2: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    seller_shipping_city: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    seller_shipping_state: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    seller_shipping_postal_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    seller_shipping_country: Mapped[str | None] = mapped_column(String(2), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     delivery_confirmation_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     hold_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -204,12 +266,44 @@ class Order(Base):
     return_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     return_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     return_tracking_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    return_tracking_carrier: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    return_tracking_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     return_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     return_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     return_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     return_confirmation_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    pii_redacted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivery_reminder_3d_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivery_reminder_1d_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hold_reminder_3d_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hold_reminder_1d_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_reminder_3d_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    return_reminder_1d_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class OrderAuditEvent(Base):
+    __tablename__ = "order_audit_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[str] = mapped_column(String(36), ForeignKey("orders.id", ondelete="CASCADE"), index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+
+
+class AdminReportRun(Base):
+    __tablename__ = "admin_report_runs"
+    __table_args__ = (UniqueConstraint("period_start", "period_end", name="uq_admin_report_period"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recipient: Mapped[str] = mapped_column(String(254), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="sent")
+    subject: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ScanJob(Base):
@@ -264,6 +358,13 @@ class Database:
                 ("email_verified", "BOOLEAN NOT NULL DEFAULT false"),
                 ("session_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("is_admin", "BOOLEAN NOT NULL DEFAULT false"),
+                ("seller_address_name", "VARCHAR(160)"),
+                ("seller_address_line1", "VARCHAR(200)"),
+                ("seller_address_line2", "VARCHAR(200)"),
+                ("seller_address_city", "VARCHAR(120)"),
+                ("seller_address_state", "VARCHAR(120)"),
+                ("seller_address_postal_code", "VARCHAR(32)"),
+                ("seller_address_country", "VARCHAR(2)"),
             ):
                 if name not in user_columns:
                     connection.execute(text(f"ALTER TABLE users ADD COLUMN {name} {definition}"))
@@ -278,9 +379,16 @@ class Database:
                 connection.execute(text("ALTER TABLE listings ADD COLUMN publication_approved BOOLEAN NOT NULL DEFAULT false"))
                 connection.execute(text("UPDATE listings SET status = 'draft' WHERE status = 'published'"))
         with self.engine.begin() as connection:
+            if "rarity_tier" not in columns:
+                connection.execute(text("ALTER TABLE listings ADD COLUMN rarity_tier VARCHAR(40) NOT NULL DEFAULT 'rare'"))
+            if "view_count" not in columns:
+                connection.execute(text("ALTER TABLE listings ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0"))
+        with self.engine.begin() as connection:
             connection.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_listings_seller_id ON listings (seller_id)")
             )
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_view_count ON listings (view_count)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_rarity_tier ON listings (rarity_tier)"))
         user_columns = {column["name"] for column in inspect(self.engine).get_columns("users")}
         if "stripe_account_id" not in user_columns:
             with self.engine.begin() as connection:
@@ -309,6 +417,25 @@ class Database:
                 ("return_approved_at", "TIMESTAMP"),
                 ("return_received_at", "TIMESTAMP"),
                 ("return_confirmation_due_at", "TIMESTAMP"),
+                ("tracking_carrier", "VARCHAR(32)"),
+                ("tracking_status", "VARCHAR(32)"),
+                ("seller_shipping_name", "VARCHAR(160)"),
+                ("seller_shipping_line1", "VARCHAR(200)"),
+                ("seller_shipping_line2", "VARCHAR(200)"),
+                ("seller_shipping_city", "VARCHAR(120)"),
+                ("seller_shipping_state", "VARCHAR(120)"),
+                ("seller_shipping_postal_code", "VARCHAR(32)"),
+                ("seller_shipping_country", "VARCHAR(2)"),
+                ("return_tracking_carrier", "VARCHAR(32)"),
+                ("return_tracking_status", "VARCHAR(32)"),
+                ("paid_at", "TIMESTAMP"),
+                ("pii_redacted_at", "TIMESTAMP"),
+                ("delivery_reminder_3d_at", "TIMESTAMP"),
+                ("delivery_reminder_1d_at", "TIMESTAMP"),
+                ("hold_reminder_3d_at", "TIMESTAMP"),
+                ("hold_reminder_1d_at", "TIMESTAMP"),
+                ("return_reminder_3d_at", "TIMESTAMP"),
+                ("return_reminder_1d_at", "TIMESTAMP"),
             ):
                 if name not in order_columns:
                     connection.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {definition}"))
@@ -323,6 +450,7 @@ class Database:
             connection.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_orders_return_confirmation_due_at ON orders (return_confirmation_due_at)")
             )
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_paid_at ON orders (paid_at)"))
             connection.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_scan_jobs_next_attempt_at ON scan_jobs (next_attempt_at)")
             )
@@ -351,6 +479,18 @@ class Database:
         }
 
     @staticmethod
+    def _seller_address_dict(user):
+        if user is None:
+            return None
+        return {
+            "name": user.seller_address_name or "", "line1": user.seller_address_line1 or "",
+            "line2": user.seller_address_line2 or "", "city": user.seller_address_city or "",
+            "state": user.seller_address_state or "", "postal_code": user.seller_address_postal_code or "",
+            "country": user.seller_address_country or "US",
+            "configured": bool(user.seller_address_name and user.seller_address_line1 and user.seller_address_city and user.seller_address_state and user.seller_address_postal_code),
+        }
+
+    @staticmethod
     def _listing_dict(listing):
         return {
             "id": listing.id,
@@ -367,6 +507,8 @@ class Database:
             "tcgdex_id": listing.tcgdex_id,
             "estimated_condition": listing.estimated_condition,
             "ai_result": listing.ai_result,
+            "rarity_tier": listing.rarity_tier,
+            "view_count": listing.view_count,
             "photos_persisted": listing.photos_persisted,
             "created_at": listing.created_at,
             "updated_at": listing.updated_at,
@@ -448,6 +590,19 @@ class Database:
                 return None
             user.is_admin = bool(enabled)
             return self._user_dict(user)
+
+    def get_seller_address(self, user_id):
+        with self.sessions() as session:
+            return self._seller_address_dict(session.get(User, user_id))
+
+    def update_seller_address(self, user_id, address):
+        with self.sessions.begin() as session:
+            user = session.get(User, user_id, with_for_update=True)
+            if user is None:
+                return None
+            for field in ("name", "line1", "line2", "city", "state", "postal_code", "country"):
+                setattr(user, f"seller_address_{field}", address.get(field) or None)
+            return self._seller_address_dict(user)
 
     def list_users(self, limit=100, offset=0, query=""):
         with self.sessions() as session:
@@ -642,6 +797,8 @@ class Database:
                     raise ListingOwnershipError("Listing not found.")
                 if values.get("status") == "published" and listing.status != "published":
                     raise ListingValidationError("Use Publish Listing to make this draft public.")
+                if "ai_result" in values:
+                    listing.rarity_tier = rarity_from_ai_result(values.get("ai_result"))
                 for key, value in values.items():
                     setattr(listing, key, value)
                 if listing.status == "published":
@@ -842,22 +999,50 @@ class Database:
             session.flush()
             return self._listing_dict(listing)
 
-    def marketplace(self, limit=20, offset=0, query="", listing_id=None):
+    def marketplace(self, limit=20, offset=0, query="", listing_id=None, top_viewed=False):
         with self.sessions() as session:
             statement = select(Listing, User).join(User, Listing.seller_id == User.id).where(Listing.status == "published", Listing.publication_approved.is_(True))
             if listing_id is not None:
                 statement = statement.where(Listing.id == listing_id)
             if query.strip():
                 statement = statement.where(Listing.title.icontains(query.strip(), autoescape=True))
-            rows = session.execute(statement.order_by(Listing.updated_at.desc(), Listing.id).limit(limit).offset(offset)).all()
+            ordering = (Listing.view_count.desc(), Listing.updated_at.desc(), Listing.id) if top_viewed else (Listing.updated_at.desc(), Listing.id)
+            rows = session.execute(statement.order_by(*ordering).limit(limit).offset(offset)).all()
             results = []
             for listing, seller in rows:
                 record = self._listing_dict(listing)
                 # Explicit public allowlist: no email, scan payload, local notes or credentials.
-                public = {key: record[key] for key in ("id", "title", "description", "price_cents", "currency", "card_name", "set_name", "card_number", "estimated_condition", "updated_at", "images")}
+                public = {key: record[key] for key in ("id", "title", "description", "price_cents", "currency", "card_name", "set_name", "card_number", "estimated_condition", "rarity_tier", "view_count", "updated_at", "images")}
                 public["seller"] = {"display_name": seller.display_name, "tier": seller.seller_tier}
                 results.append(public)
             return results
+
+    def increment_listing_view(self, listing_id, viewer_hash, viewed_on=None):
+        viewed_on = viewed_on or utc_now().date()
+        try:
+            with self.sessions.begin() as session:
+                listing = session.get(Listing, listing_id, with_for_update=True)
+                if listing is None or listing.status != "published" or not listing.publication_approved:
+                    return None
+                exists = session.execute(select(ListingView.id).where(
+                    ListingView.listing_id == listing_id,
+                    ListingView.viewer_hash == viewer_hash,
+                    ListingView.viewed_on == viewed_on,
+                )).scalar_one_or_none()
+                if exists is None:
+                    session.add(ListingView(listing_id=listing_id, viewer_hash=viewer_hash, viewed_on=viewed_on))
+                    listing.view_count += 1
+                return listing.view_count
+        except IntegrityError:
+            # A simultaneous duplicate detail request may win the unique insert.
+            with self.sessions() as session:
+                listing = session.get(Listing, listing_id)
+                return listing.view_count if listing else None
+
+    def prune_listing_view_deduplication(self, retention_days=90, now=None):
+        cutoff = (now or utc_now()).date() - timedelta(days=max(1, retention_days))
+        with self.sessions.begin() as session:
+            return session.execute(delete(ListingView).where(ListingView.viewed_on < cutoff)).rowcount
 
     def list_listings(self, seller_id, limit=50, offset=0):
         with self.sessions() as session:
@@ -918,6 +1103,8 @@ class Database:
             "currency": order.currency, "stripe_checkout_session_id": order.stripe_checkout_session_id,
             "stripe_payment_intent_id": order.stripe_payment_intent_id,
             "tracking_number": order.tracking_number,
+            "tracking_carrier": order.tracking_carrier,
+            "tracking_status": order.tracking_status,
             "shipping_name": order.shipping_name,
             "shipping_line1": order.shipping_line1,
             "shipping_line2": order.shipping_line2,
@@ -925,6 +1112,13 @@ class Database:
             "shipping_state": order.shipping_state,
             "shipping_postal_code": order.shipping_postal_code,
             "shipping_country": order.shipping_country,
+            "seller_shipping_name": order.seller_shipping_name,
+            "seller_shipping_line1": order.seller_shipping_line1,
+            "seller_shipping_line2": order.seller_shipping_line2,
+            "seller_shipping_city": order.seller_shipping_city,
+            "seller_shipping_state": order.seller_shipping_state,
+            "seller_shipping_postal_code": order.seller_shipping_postal_code,
+            "seller_shipping_country": order.seller_shipping_country,
             "delivered_at": order.delivered_at,
             "delivery_confirmation_due_at": order.delivery_confirmation_due_at,
             "hold_until": order.hold_until, "completed_at": order.completed_at,
@@ -933,10 +1127,14 @@ class Database:
             "return_reason": order.return_reason,
             "return_notes": order.return_notes,
             "return_tracking_number": order.return_tracking_number,
+            "return_tracking_carrier": order.return_tracking_carrier,
+            "return_tracking_status": order.return_tracking_status,
             "return_requested_at": order.return_requested_at,
             "return_approved_at": order.return_approved_at,
             "return_received_at": order.return_received_at,
             "return_confirmation_due_at": order.return_confirmation_due_at,
+            "paid_at": order.paid_at,
+            "pii_redacted_at": order.pii_redacted_at,
             "created_at": order.created_at, "updated_at": order.updated_at,
         }
         if listing is not None:
@@ -952,6 +1150,34 @@ class Database:
             result["seller_display_name"] = seller.display_name
         return result
 
+    @classmethod
+    def _participant_order_dict(cls, order, requester_id, listing=None, buyer=None, seller=None):
+        result = cls._order_dict(order, listing, buyer, seller)
+        if requester_id == order.buyer_id and order.status not in {"return_approved", "return_shipped", "refund_pending", "refunded"}:
+            for field in ("seller_shipping_name", "seller_shipping_line1", "seller_shipping_line2", "seller_shipping_city", "seller_shipping_state", "seller_shipping_postal_code", "seller_shipping_country"):
+                result[field] = None
+        return result
+
+    @staticmethod
+    def _audit(session, order_id, event_type, actor_user_id=None, details=None):
+        session.add(OrderAuditEvent(order_id=order_id, event_type=event_type, actor_user_id=actor_user_id, details=details))
+
+    @staticmethod
+    def _decorate_admin_deadline(record, now=None):
+        now = now or utc_now()
+        mapping = {
+            "shipped": ("delivery_confirmation", record.get("delivery_confirmation_due_at")),
+            "protection_hold": ("seller_payout_hold", record.get("hold_until")),
+            "return_shipped": ("return_confirmation", record.get("return_confirmation_due_at")),
+        }
+        kind, due = mapping.get(record.get("status"), (None, None))
+        if due is not None and due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        record["active_deadline_type"] = kind
+        record["active_deadline_at"] = due
+        record["deadline_remaining_seconds"] = max(0, int((due - now).total_seconds())) if due else None
+        return record
+
     def create_pending_order(self, order_id, listing_id, buyer_id, commission_percent, shipping_cents=0):
         """Create a checkout attempt without reserving the one-of-one listing."""
         with self.sessions.begin() as session:
@@ -960,11 +1186,24 @@ class Database:
                 raise ListingValidationError("This card is no longer available.")
             if listing.seller_id == buyer_id:
                 raise ListingValidationError("You cannot buy your own listing.")
+            seller = session.get(User, listing.seller_id)
+            address = self._seller_address_dict(seller)
+            if not address or not address["configured"]:
+                raise ListingValidationError("The seller must add a return shipping address before this card can be purchased.")
             item_cents = int(listing.price_cents or 0)
             commission_cents = (item_cents * commission_percent + 99) // 100
-            order = Order(id=order_id, listing_id=listing_id, buyer_id=buyer_id, seller_id=listing.seller_id, item_cents=item_cents, shipping_cents=shipping_cents, commission_cents=commission_cents, seller_amount_cents=item_cents + shipping_cents - commission_cents, currency=listing.currency)
+            order = Order(
+                id=order_id, listing_id=listing_id, buyer_id=buyer_id, seller_id=listing.seller_id,
+                item_cents=item_cents, shipping_cents=shipping_cents, commission_cents=commission_cents,
+                seller_amount_cents=item_cents + shipping_cents - commission_cents, currency=listing.currency,
+                seller_shipping_name=address["name"], seller_shipping_line1=address["line1"],
+                seller_shipping_line2=address["line2"] or None, seller_shipping_city=address["city"],
+                seller_shipping_state=address["state"], seller_shipping_postal_code=address["postal_code"],
+                seller_shipping_country=address["country"],
+            )
             session.add(order)
             session.flush()
+            self._audit(session, order.id, "checkout_created", buyer_id)
             return self._order_dict(order)
 
     # Kept for callers from the previous backend release. Pending checkouts no
@@ -1007,10 +1246,12 @@ class Database:
             if listing and listing.status == "published" and listing.publication_approved:
                 order.status = "paid"
                 order.stripe_payment_intent_id = payment_intent_id
+                order.paid_at = order.paid_at or utc_now()
                 listing.status = "sold"
                 listing.publication_approved = False
                 listing.updated_at = utc_now()
                 order.updated_at = utc_now()
+                self._audit(session, order.id, "payment_confirmed", order.buyer_id)
                 session.flush()
                 return {"won": True, "already_processed": False, "order": self._order_dict(order)}
 
@@ -1037,6 +1278,7 @@ class Database:
                         listing.status = "draft"
                         listing.publication_approved = False
                         listing.updated_at = utc_now()
+                self._audit(session, order.id, "refund_issued", details={"refund_id": refund_id})
             return self._order_dict(order)
 
     def mark_order_paid(self, session_id, payment_intent_id=None):
@@ -1049,8 +1291,9 @@ class Database:
             order = session.get(Order, order_id)
             if order is None or user_id not in {order.buyer_id, order.seller_id}:
                 return None
-            return self._order_dict(
+            return self._participant_order_dict(
                 order,
+                user_id,
                 session.get(Listing, order.listing_id),
                 session.get(User, order.buyer_id),
                 session.get(User, order.seller_id),
@@ -1072,6 +1315,7 @@ class Database:
             order.shipping_postal_code = (address.get("postal_code") or "").strip() or None
             order.shipping_country = (address.get("country") or "").strip().upper()[:2] or None
             order.updated_at = utc_now()
+            self._audit(session, order.id, "buyer_shipping_saved", order.buyer_id)
             return self._order_dict(order)
 
     def confirm_delivery(self, order_id, buyer_id, hold_days):
@@ -1090,6 +1334,7 @@ class Database:
             order.delivered_at = order.delivered_at or utc_now()
             order.hold_until = order.hold_until or utc_now() + timedelta(days=hold_days)
             order.updated_at = utc_now()
+            self._audit(session, order.id, "delivery_confirmed", buyer_id)
             return self._order_dict(order)
 
     def list_orders(self, user_id, limit=50, offset=0):
@@ -1099,8 +1344,9 @@ class Database:
                 .order_by(Order.created_at.desc()).limit(limit).offset(offset)
             ).scalars().all()
             return [
-                self._order_dict(
+                self._participant_order_dict(
                     order,
+                    user_id,
                     session.get(Listing, order.listing_id),
                     session.get(User, order.buyer_id),
                     session.get(User, order.seller_id),
@@ -1117,21 +1363,34 @@ class Database:
             if transfer_id:
                 order.stripe_transfer_id = transfer_id
             order.updated_at = utc_now()
+            self._audit(session, order.id, "payout_status_changed", details={"status": status, "transfer_id": transfer_id})
             return self._order_dict(order)
 
-    def set_tracking(self, order_id, seller_id, tracking_number, timeout_days=10):
+    def set_tracking(self, order_id, seller_id, tracking_number, carrier=None, timeout_days=10):
+        if isinstance(carrier, (int, float)):
+            timeout_days, carrier = carrier, "Unverified"
+        carrier = carrier or "Unverified"
         with self.sessions.begin() as session:
             order = session.get(Order, order_id, with_for_update=True)
             if order is None or order.seller_id != seller_id:
                 return None
             if order.status not in {"paid", "shipped"}:
                 raise ListingValidationError("Tracking can only be added to a paid order.")
+            reused = session.execute(select(Order.id).where(
+                Order.id != order_id,
+                or_(Order.tracking_number == tracking_number, Order.return_tracking_number == tracking_number),
+            )).scalar_one_or_none()
+            if reused:
+                raise ListingValidationError("This tracking number is already attached to another order.")
             first_shipment = order.status == "paid"
             order.tracking_number = tracking_number
+            order.tracking_carrier = carrier
+            order.tracking_status = "submitted"
             order.status = "shipped"
             if first_shipment or order.delivery_confirmation_due_at is None:
                 order.delivery_confirmation_due_at = utc_now() + timedelta(days=timeout_days)
             order.updated_at = utc_now()
+            self._audit(session, order.id, "outbound_tracking_submitted", seller_id, {"carrier": carrier})
             return self._order_dict(order)
 
     def request_return(self, order_id, buyer_id, reason, notes=""):
@@ -1156,6 +1415,7 @@ class Database:
             order.return_requested_at = utc_now()
             order.payout_status = "on_hold"
             order.updated_at = utc_now()
+            self._audit(session, order.id, "return_requested", buyer_id, {"reason": reason})
             return self._order_dict(order)
 
     def review_return(self, order_id, seller_id, approved):
@@ -1169,21 +1429,34 @@ class Database:
             if approved:
                 order.return_approved_at = utc_now()
             order.updated_at = utc_now()
+            self._audit(session, order.id, "return_approved" if approved else "return_disputed", seller_id)
             return self._order_dict(order)
 
-    def set_return_tracking(self, order_id, buyer_id, tracking_number, timeout_days=10):
+    def set_return_tracking(self, order_id, buyer_id, tracking_number, carrier=None, timeout_days=10):
+        if isinstance(carrier, (int, float)):
+            timeout_days, carrier = carrier, "Unverified"
+        carrier = carrier or "Unverified"
         with self.sessions.begin() as session:
             order = session.get(Order, order_id, with_for_update=True)
             if order is None or order.buyer_id != buyer_id:
                 return None
             if order.status not in {"return_approved", "return_shipped"}:
                 raise ListingValidationError("This return is not ready for return shipping.")
+            reused = session.execute(select(Order.id).where(
+                Order.id != order_id,
+                or_(Order.tracking_number == tracking_number, Order.return_tracking_number == tracking_number),
+            )).scalar_one_or_none()
+            if reused or order.tracking_number == tracking_number:
+                raise ListingValidationError("This tracking number is already attached to an order.")
             first_return_shipment = order.status == "return_approved"
             order.return_tracking_number = tracking_number
+            order.return_tracking_carrier = carrier
+            order.return_tracking_status = "submitted"
             order.status = "return_shipped"
             if first_return_shipment or order.return_confirmation_due_at is None:
                 order.return_confirmation_due_at = utc_now() + timedelta(days=timeout_days)
             order.updated_at = utc_now()
+            self._audit(session, order.id, "return_tracking_submitted", buyer_id, {"carrier": carrier})
             return self._order_dict(order)
 
     def begin_return_refund(self, order_id, seller_id):
@@ -1197,6 +1470,7 @@ class Database:
                 order.status = "refund_pending"
                 order.return_received_at = utc_now()
                 order.updated_at = utc_now()
+                self._audit(session, order.id, "return_received", seller_id)
             return self._order_dict(order)
 
     def resolve_return_dispute(self, order_id, approved, timeout_days=10):
@@ -1218,6 +1492,7 @@ class Database:
                         utc_now() + timedelta(days=timeout_days)
                     )
             order.updated_at = utc_now()
+            self._audit(session, order.id, "return_dispute_approved" if approved else "return_dispute_denied")
             return self._order_dict(order)
 
     def backfill_confirmation_deadlines(self, timeout_days=10):
@@ -1273,6 +1548,7 @@ class Database:
         order.hold_until = order.hold_until or now
         order.completed_at = now
         order.updated_at = now
+        session.add(OrderAuditEvent(order_id=order.id, event_type="order_completed"))
         buyer, seller = session.get(User, order.buyer_id), session.get(User, order.seller_id)
         buyer.completed_buys += 1
         seller.successful_sales += 1
@@ -1324,6 +1600,7 @@ class Database:
             order.status = "refund_pending"
             order.return_received_at = order.return_received_at or now
             order.updated_at = now
+            self._audit(session, order.id, "return_auto_confirmed")
             return self._order_dict(order)
 
     def list_return_disputes(self):
@@ -1340,6 +1617,127 @@ class Database:
                 )
                 for order in orders
             ]
+
+    def list_admin_sales(self, limit=100, offset=0, query="", period_start=None, period_end=None):
+        with self.sessions() as session:
+            buyer_alias = aliased(User)
+            seller_alias = aliased(User)
+            statement = select(Order, Listing, buyer_alias, seller_alias).join(
+                Listing, Order.listing_id == Listing.id
+            ).join(buyer_alias, Order.buyer_id == buyer_alias.id).join(seller_alias, Order.seller_id == seller_alias.id)
+            statement = statement.where(Order.status.not_in(("pending_payment", "canceled")))
+            if period_start is not None:
+                statement = statement.where(func.coalesce(Order.paid_at, Order.created_at) >= period_start)
+            if period_end is not None:
+                statement = statement.where(func.coalesce(Order.paid_at, Order.created_at) < period_end)
+            if query.strip():
+                needle = f"%{query.strip().lower()}%"
+                statement = statement.where(or_(
+                    func.lower(Order.id).like(needle), func.lower(Listing.title).like(needle),
+                    func.lower(buyer_alias.email).like(needle), func.lower(seller_alias.email).like(needle),
+                ))
+            rows = session.execute(statement.order_by(func.coalesce(Order.paid_at, Order.created_at).desc()).limit(limit).offset(offset)).all()
+            results = []
+            for order, listing, buyer, seller in rows:
+                record = self._order_dict(order, listing, buyer, seller)
+                record.update(buyer_email=buyer.email, seller_email=seller.email)
+                results.append(self._decorate_admin_deadline(record))
+            return results
+
+    def get_admin_sale(self, order_id):
+        with self.sessions() as session:
+            order = session.get(Order, order_id)
+            if order is None:
+                return None
+            result = self._order_dict(order, session.get(Listing, order.listing_id), session.get(User, order.buyer_id), session.get(User, order.seller_id))
+            result.update(buyer_email=session.get(User, order.buyer_id).email, seller_email=session.get(User, order.seller_id).email)
+            self._decorate_admin_deadline(result)
+            events = session.execute(select(OrderAuditEvent).where(OrderAuditEvent.order_id == order_id).order_by(OrderAuditEvent.created_at)).scalars().all()
+            result["audit_events"] = [{"id": event.id, "event_type": event.event_type, "actor_user_id": event.actor_user_id, "details": event.details, "created_at": event.created_at} for event in events]
+            return result
+
+    def admin_diagnostics(self, now=None):
+        now = now or utc_now()
+        soon = now + timedelta(hours=24)
+        with self.sessions() as session:
+            scalar = lambda condition: session.scalar(select(func.count()).select_from(Order).where(condition)) or 0
+            last_report = session.execute(select(AdminReportRun).where(AdminReportRun.status == "sent").order_by(AdminReportRun.sent_at.desc()).limit(1)).scalar_one_or_none()
+            return {
+                "open_orders": scalar(Order.status.in_(("paid", "shipped", "protection_hold", "return_requested", "return_approved", "return_shipped", "return_disputed", "refund_pending"))),
+                "failed_payouts": scalar(Order.payout_status == "failed"),
+                "pending_refunds": scalar(Order.status == "refund_pending"),
+                "return_disputes": scalar(Order.status == "return_disputed"),
+                "deadlines_within_24h": scalar(or_(
+                    and_(Order.delivery_confirmation_due_at > now, Order.delivery_confirmation_due_at <= soon),
+                    and_(Order.hold_until > now, Order.hold_until <= soon),
+                    and_(Order.return_confirmation_due_at > now, Order.return_confirmation_due_at <= soon),
+                )),
+                "queued_scans": session.scalar(select(func.count()).select_from(ScanJob).where(ScanJob.status.in_(("queued", "processing")))) or 0,
+                "failed_scans": session.scalar(select(func.count()).select_from(ScanJob).where(ScanJob.status == "failed")) or 0,
+                "last_report_sent_at": last_report.sent_at if last_report else None,
+                "last_report_subject": last_report.subject if last_report else None,
+                "tracking_verification": "format_and_reuse_guard",
+            }
+
+    def due_deadline_reminders(self, now=None):
+        now = now or utc_now()
+        candidates = []
+        with self.sessions() as session:
+            orders = session.execute(select(Order).where(Order.status.in_(("shipped", "protection_hold", "return_shipped")))).scalars().all()
+            for order in orders:
+                if order.status == "shipped":
+                    due, prefix, recipient = order.delivery_confirmation_due_at, "delivery", order.buyer_id
+                elif order.status == "protection_hold":
+                    due, prefix, recipient = order.hold_until, "hold", order.seller_id
+                else:
+                    due, prefix, recipient = order.return_confirmation_due_at, "return", order.seller_id
+                if not due:
+                    continue
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+                remaining = due - now
+                for days in (3, 1):
+                    field = f"{prefix}_reminder_{days}d_at"
+                    if timedelta(0) < remaining <= timedelta(days=days) and getattr(order, field) is None:
+                        candidates.append({"order_id": order.id, "user_id": recipient, "kind": prefix, "days": days, "due_at": due})
+                        break
+        return candidates
+
+    def mark_deadline_reminder(self, order_id, kind, days, now=None):
+        field = f"{kind}_reminder_{days}d_at"
+        if field not in {"delivery_reminder_3d_at", "delivery_reminder_1d_at", "hold_reminder_3d_at", "hold_reminder_1d_at", "return_reminder_3d_at", "return_reminder_1d_at"}:
+            return False
+        with self.sessions.begin() as session:
+            order = session.get(Order, order_id, with_for_update=True)
+            if order is None or getattr(order, field) is not None:
+                return False
+            setattr(order, field, now or utc_now())
+            self._audit(session, order_id, f"{kind}_deadline_reminder_{days}d")
+            return True
+
+    def report_already_sent(self, period_start, period_end):
+        with self.sessions() as session:
+            return session.execute(select(AdminReportRun.id).where(AdminReportRun.period_start == period_start, AdminReportRun.period_end == period_end, AdminReportRun.status == "sent")).scalar_one_or_none() is not None
+
+    def record_report_sent(self, period_start, period_end, recipient, subject):
+        with self.sessions.begin() as session:
+            existing = session.execute(select(AdminReportRun).where(AdminReportRun.period_start == period_start, AdminReportRun.period_end == period_end)).scalar_one_or_none()
+            if existing is None:
+                session.add(AdminReportRun(period_start=period_start, period_end=period_end, recipient=recipient, status="sent", subject=subject, sent_at=utc_now()))
+            else:
+                existing.recipient, existing.status, existing.subject, existing.sent_at = recipient, "sent", subject, utc_now()
+
+    def redact_expired_sale_addresses(self, retention_days=30, now=None):
+        cutoff = (now or utc_now()) - timedelta(days=retention_days)
+        fields = ("shipping_name", "shipping_line1", "shipping_line2", "shipping_city", "shipping_state", "shipping_postal_code", "shipping_country", "seller_shipping_name", "seller_shipping_line1", "seller_shipping_line2", "seller_shipping_city", "seller_shipping_state", "seller_shipping_postal_code", "seller_shipping_country")
+        with self.sessions.begin() as session:
+            orders = session.execute(select(Order).where(Order.pii_redacted_at.is_(None), func.coalesce(Order.paid_at, Order.created_at) < cutoff, Order.status.not_in(("pending_payment", "canceled")))).scalars().all()
+            for order in orders:
+                for field in fields:
+                    setattr(order, field, None)
+                order.pii_redacted_at = now or utc_now()
+                self._audit(session, order.id, "shipping_pii_redacted", details={"retention_days": retention_days})
+            return len(orders)
 
     def complete_order(self, order_id, user_id):
         with self.sessions.begin() as session:

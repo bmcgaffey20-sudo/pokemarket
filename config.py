@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     seller_hold_days: int = 10
     confirmation_timeout_days: int = 10
     settlement_worker_poll_seconds: float = 60
+    sale_detail_retention_days: int = 30
+    admin_report_email: str = ""
     admin_emails: str = ""
     firebase_project_id: str | None = None
     firebase_service_account_json: str | None = None
@@ -84,6 +86,11 @@ class Settings(BaseSettings):
     @property
     def firebase_configured(self):
         return bool((self.firebase_project_id or "").strip() and (self.firebase_service_account_json or "").strip())
+
+    @property
+    def admin_report_recipient(self):
+        value = self.admin_report_email.strip().lower()
+        return value if "@" in value and not any(c in value for c in "\r\n") else ""
 
 @lru_cache
 def get_settings():

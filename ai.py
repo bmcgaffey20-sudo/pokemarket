@@ -15,6 +15,13 @@ IDENTIFICATION_SCHEMA = {
         "number": {"type": ["string", "null"]},
         "language": {"type": ["string", "null"]},
         "variant": {"type": ["string", "null"]},
+        "rarity": {
+            "type": "string",
+            "enum": [
+                "rare", "double_rare", "ultra_rare", "illustration_rare",
+                "special_illustration_rare", "hyper_illustration_rare"
+            ],
+        },
         "tcgdex_id": {"type": ["string", "null"]},
         "confidence": {"type": "number"},
         "observations": {"type": "array", "items": {"type": "string"}},
@@ -25,6 +32,7 @@ IDENTIFICATION_SCHEMA = {
         "number",
         "language",
         "variant",
+        "rarity",
         "tcgdex_id",
         "confidence",
         "observations",
@@ -124,6 +132,8 @@ Identify:
 - collector/card number
 - language
 - variant
+- printed rarity tier: rare, double rare, ultra rare, illustration rare,
+  special illustration rare, or hyper illustration rare
 - exact TCGdex ID ONLY when highly confident
 
 Do NOT make authenticity judgments in this stage.
@@ -188,6 +198,9 @@ condition and preliminary authenticity screening in the same response.
 
 Identification:
 - Read the card name, set, collector number, language and variant carefully.
+- Classify its printed rarity as rare, double rare, ultra rare, illustration
+  rare, special illustration rare, or hyper illustration rare. Use the card's
+  printed/set evidence, not market value. When evidence is inconclusive, use rare.
 - Return an exact TCGdex ID only when highly confident.
 - Lower confidence instead of inventing missing details.
 
@@ -225,6 +238,7 @@ class StubProvider:
             "number": None,
             "language": None,
             "variant": None,
+            "rarity": "rare",
             "tcgdex_id": None,
             "confidence": 0.0,
             "observations": [],

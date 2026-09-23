@@ -1,6 +1,6 @@
-# PokeMarket Backend 2.14.0 — automatic settlement safeguards
+# PokeMarket Backend 2.16.0 — viewed listings and rarity tiers
 
-Read `UPDATE-2.14.0.md` for this release's deployment notes. The older update
+Read `UPDATE-2.16.0.md` for this release's deployment notes. The older update
 files remain as a history of the account, publishing, cloud-photo, and deletion
 changes that are already included here.
 
@@ -35,13 +35,18 @@ The service creates the application tables on first connection, including:
   counters, and listing limit.
 
 - `listings`: draft metadata, card identity, condition, price, status, AI result,
-  and timestamps.
+  normalized rarity tier, public view total, and timestamps.
+- `listing_views`: one-way daily viewer hashes used only to prevent refreshes
+  inflating public view totals; raw IP addresses are never stored.
 - `listing_images`: label, permanent R2 object key, MIME type, byte size, order,
   and whether the image is a defect close-up.
 - `orders`: buyer, seller, listing, Stripe payment state, 4% marketplace
   commission, delivery-protection hold, and seller payout state.
 - `scan_jobs`: durable queued/processing/completed AI scan state and results.
 - `device_tokens`: account-owned Android Firebase notification tokens.
+- `order_audit_events`: immutable sale-lifecycle events used by the private
+  administrator sale-detail screen.
+- `admin_report_runs`: idempotency records for completed weekly CSV reports.
 
 Originals use versioned private keys such as:
 
@@ -92,6 +97,17 @@ Checkout and orders:
   completed orders, and administrator seller-tier changes.
 - Administrators can list users, manually set seller tiers, and resolve return
   disputes. Access is restricted to accounts listed in `ADMIN_EMAILS`.
+- The private Admin Sales screen lists every beta sale and exposes buyer/seller
+  contact details, address snapshots, totals, payout state, tracking state,
+  active deadline, and audit history. Full shipping-address fields are redacted
+  automatically after 30 days; financial totals and lifecycle history remain.
+- Completed seven-day UTC sales reports are emailed as CSV attachments once per
+  week. The report run is recorded so restarts cannot send a duplicate period.
+- Three-day and one-day push reminders warn the responsible buyer or seller
+  before purchase, protection-hold, and return deadlines expire.
+- USPS, UPS, and FedEx tracking numbers are normalized, format-checked, carrier
+  classified, and blocked from reuse across orders. `submitted` means PokeMarket
+  accepted the number; this release does not claim live carrier verification.
 - Gemini capacity errors are retried by the durable worker with exponential
   delays, while the original R2 photos remain safely stored.
 
@@ -128,6 +144,8 @@ STRIPE_SECRET_KEY=sk_test_<your Stripe test secret>
 STRIPE_PUBLISHABLE_KEY=pk_test_<your Stripe test publishable key>
 STRIPE_WEBHOOK_SECRET=whsec_<your Stripe test webhook signing secret>
 ADMIN_EMAILS=<your signed-in PokeMarket email>
+ADMIN_REPORT_EMAIL=<private weekly-report recipient>
+SALE_DETAIL_RETENTION_DAYS=30
 CONFIRMATION_TIMEOUT_DAYS=10
 SETTLEMENT_WORKER_POLL_SECONDS=60
 FIREBASE_PROJECT_ID=<your Firebase project ID>
@@ -141,7 +159,7 @@ Run it twice and paste each result directly into the matching Render environment
 variable. Never put either value in GitHub or the Android project.
 
 After deployment, `/api/v1/health` should include version
-`2.14.0-auto-settlement`, `database:"connected"`, `auth:"configured"`,
+`2.16.0-viewed-rarity`, `database:"connected"`, `auth:"configured"`,
 `payments:"configured"`, and `push_notifications:"configured"` when Firebase
 is configured.
 
