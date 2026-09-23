@@ -1,4 +1,7 @@
 import re
+import hashlib
+import threading
+from io import BytesIO
 from pathlib import PurePosixPath
 from uuid import uuid4
 
@@ -10,6 +13,7 @@ CONTENT_TYPE_EXTENSIONS = {
     "image/png": ".png",
     "image/webp": ".webp",
 }
+THUMBNAIL_LOCK = threading.Lock()
 
 
 class R2ConfigurationError(RuntimeError):
@@ -21,6 +25,58 @@ class R2UploadError(RuntimeError):
 
 
 class R2Storage:
+    @staticmethod
+    def thumbnail_key(object_key):
+        return "listing-thumbnails/v1/" + hashlib.sha256(object_key.encode()).hexdigest() + ".jpg"
+
+    def listing_thumbnail(self, object_key, max_image_bytes):
+        """Generate a small display copy once; never overwrite the scan original."""
+        from PIL import Image, ImageOps
+        from botocore.exceptions import ClientError
+        key = self.thumbnail_key(object_key)
+        def exists():
+            try:
+                self.client.head_object(Bucket=self.bucket_name, Key=key)
+                return True
+            except ClientError as exc:
+                if str(exc.response.get("Error", {}).get("Code")) in {"404", "NoSuchKey", "NotFound"}:
+                    return False
+                raise
+        if exists():
+            return self.presign_object(key)
+        # Bound Pillow memory use on a small Render instance.
+        if not THUMBNAIL_LOCK.acquire(timeout=25):
+            raise R2UploadError("Photo previews are being prepared. Please retry.")
+        try:
+            if not exists():
+                response = self.client.get_object(Bucket=self.bucket_name, Key=object_key)
+                try:
+                    original = response["Body"].read(max_image_bytes + 1)
+                finally:
+                    response["Body"].close()
+                if not original or len(original) > max_image_bytes:
+                    raise R2UploadError("Photo exceeds preview size limits.")
+                with Image.open(BytesIO(original)) as photo:
+                    if photo.width * photo.height > 40_000_000:
+                        raise R2UploadError("Photo exceeds preview pixel limits.")
+                    photo.draft("RGB", (1280, 1280))
+                    preview = ImageOps.exif_transpose(photo)
+                    try:
+                        preview.thumbnail((640, 640), Image.Resampling.LANCZOS)
+                        output = BytesIO()
+                        rgb = preview.convert("RGB")
+                        try:
+                            rgb.save(output, format="JPEG", quality=92, optimize=True)
+                        finally:
+                            rgb.close()
+                        self.client.put_object(Bucket=self.bucket_name, Key=key, Body=output.getvalue(),
+                            ContentType="image/jpeg", CacheControl="private, max-age=86400")
+                    finally:
+                        preview.close()
+            return self.presign_object(key)
+        finally:
+            THUMBNAIL_LOCK.release()
+
     def __init__(self, settings, client=None):
         missing = [
             name
@@ -180,7 +236,9 @@ class R2Storage:
 
     def delete_objects(self, object_keys):
         failures = []
-        for object_key in object_keys:
+        keys = list(object_keys)
+        keys.extend(self.thumbnail_key(key) for key in object_keys if key.startswith("listings/") and "/originals/" in key)
+        for object_key in dict.fromkeys(keys):
             try:
                 self.client.delete_object(Bucket=self.bucket_name, Key=object_key)
             except Exception as exc:
