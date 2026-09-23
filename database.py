@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import time
+from market_rules import SELLER_PRICE_LIMITS, price_tier
 
 from sqlalchemy import (
     and_,
@@ -48,6 +49,12 @@ class ListingValidationError(DatabaseOperationError):
 
 
 def validate_publication(listing, seller):
+    if listing.market not in {"pokemon", "magic", "sports"} or listing.grading_status not in {"graded", "ungraded"}:
+        raise ListingValidationError("Choose a valid market and grading status.")
+    if listing.grading_status == "graded":
+        for field in ("grading_company", "grade", "certification_number"):
+            if not (getattr(listing, field) or "").strip():
+                raise ListingValidationError(f"Add {field.replace('_', ' ')} from the slab label before publishing.")
     for field in ("title", "description", "card_name", "estimated_condition"):
         if not (getattr(listing, field) or "").strip():
             raise ListingValidationError(f"Add {field.replace('_', ' ')} before publishing.")
@@ -160,6 +167,11 @@ class Listing(Base):
     __tablename__ = "listings"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    market: Mapped[str] = mapped_column(String(16), default="pokemon", server_default="pokemon", nullable=False)
+    grading_status: Mapped[str] = mapped_column(String(16), default="ungraded", server_default="ungraded", nullable=False)
+    grading_company: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    grade: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    certification_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
     seller_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
@@ -310,6 +322,8 @@ class ScanJob(Base):
     __tablename__ = "scan_jobs"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    market: Mapped[str] = mapped_column(String(16), default="pokemon", server_default="pokemon", nullable=False)
+    grading_status: Mapped[str] = mapped_column(String(16), default="ungraded", server_default="ungraded", nullable=False)
     listing_id: Mapped[str] = mapped_column(String(64), ForeignKey("listings.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True)
     status: Mapped[str] = mapped_column(String(24), default="queued", nullable=False, index=True)
@@ -383,6 +397,15 @@ class Database:
                 connection.execute(text("ALTER TABLE listings ADD COLUMN rarity_tier VARCHAR(40) NOT NULL DEFAULT 'rare'"))
             if "view_count" not in columns:
                 connection.execute(text("ALTER TABLE listings ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0"))
+            for name, definition in (
+                ("market", "VARCHAR(16) NOT NULL DEFAULT 'pokemon'"),
+                ("grading_status", "VARCHAR(16) NOT NULL DEFAULT 'ungraded'"),
+                ("grading_company", "VARCHAR(64)"), ("grade", "VARCHAR(32)"),
+                ("certification_number", "VARCHAR(128)"),
+            ):
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE listings ADD COLUMN {name} {definition}"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_listings_market_grading ON listings (market, grading_status, status, view_count)"))
         with self.engine.begin() as connection:
             connection.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_listings_seller_id ON listings (seller_id)")
@@ -440,6 +463,10 @@ class Database:
                 if name not in order_columns:
                     connection.execute(text(f"ALTER TABLE orders ADD COLUMN {name} {definition}"))
         scan_columns = {column["name"] for column in inspect(self.engine).get_columns("scan_jobs")}
+        with self.engine.begin() as connection:
+            for name, default in (("market", "pokemon"), ("grading_status", "ungraded")):
+                if name not in scan_columns:
+                    connection.execute(text(f"ALTER TABLE scan_jobs ADD COLUMN {name} VARCHAR(16) NOT NULL DEFAULT '{default}'"))
         if "next_attempt_at" not in scan_columns:
             with self.engine.begin() as connection:
                 connection.execute(text("ALTER TABLE scan_jobs ADD COLUMN next_attempt_at TIMESTAMP"))
@@ -507,6 +534,11 @@ class Database:
             "tcgdex_id": listing.tcgdex_id,
             "estimated_condition": listing.estimated_condition,
             "ai_result": listing.ai_result,
+            "market": listing.market,
+            "grading_status": listing.grading_status,
+            "grading_company": listing.grading_company,
+            "grade": listing.grade,
+            "certification_number": listing.certification_number,
             "rarity_tier": listing.rarity_tier,
             "view_count": listing.view_count,
             "photos_persisted": listing.photos_persisted,
@@ -618,7 +650,7 @@ class Database:
             return [self._user_dict(user) for user in users]
 
     def set_seller_tier(self, user_id, tier):
-        limits = {1: 8_000, 2: 10_000, 3: 20_000, 4: 25_000, 5: 100_000}
+        limits = SELLER_PRICE_LIMITS
         if tier not in limits:
             raise ListingValidationError("Seller tier must be between 1 and 5.")
         with self.sessions.begin() as session:
@@ -797,6 +829,11 @@ class Database:
                     raise ListingOwnershipError("Listing not found.")
                 if values.get("status") == "published" and listing.status != "published":
                     raise ListingValidationError("Use Publish Listing to make this draft public.")
+                if listing.status not in (None, "draft", "archived") and any(
+                    field in values and values[field] != getattr(listing, field)
+                    for field in ("market", "grading_status")
+                ):
+                    raise ListingValidationError("Withdraw this listing before changing its market or grading status.")
                 if "ai_result" in values:
                     listing.rarity_tier = rarity_from_ai_result(values.get("ai_result"))
                 for key, value in values.items():
@@ -899,6 +936,8 @@ class Database:
             "status": job.status,
             "include_condition": job.include_condition,
             "include_authenticity": job.include_authenticity,
+            "market": job.market,
+            "grading_status": job.grading_status,
             "result": job.result,
             "error": job.error,
             "attempts": job.attempts,
@@ -907,23 +946,31 @@ class Database:
             "updated_at": job.updated_at,
         }
 
-    def create_scan_job(self, job_id, listing_id, user_id, include_condition=True, include_authenticity=True):
+    def create_scan_job(self, job_id, listing_id, user_id, include_condition=True, include_authenticity=True, market="pokemon", grading_status="ungraded"):
         try:
             with self.sessions.begin() as session:
                 listing = session.get(Listing, listing_id)
                 if listing is None or listing.seller_id != user_id or not listing.photos_persisted:
                     raise ListingOwnershipError("Listing photos are not available for analysis.")
+                if market not in {"pokemon", "magic", "sports"} or grading_status not in {"graded", "ungraded"}:
+                    raise ListingValidationError("Invalid scan category.")
+                if listing.status != "draft":
+                    raise ListingValidationError("Only draft listings can be scanned.")
+                listing.market = market
+                listing.grading_status = grading_status
                 job = ScanJob(
                     id=job_id,
                     listing_id=listing_id,
                     user_id=user_id,
                     include_condition=include_condition,
                     include_authenticity=include_authenticity,
+                    market=market,
+                    grading_status=grading_status,
                 )
                 session.add(job)
                 session.flush()
                 return self._scan_job_dict(job)
-        except ListingOwnershipError:
+        except (ListingOwnershipError, ListingValidationError):
             raise
         except Exception as exc:
             raise DatabaseOperationError(f"Could not queue scan: {exc}") from exc
@@ -999,9 +1046,13 @@ class Database:
             session.flush()
             return self._listing_dict(listing)
 
-    def marketplace(self, limit=20, offset=0, query="", listing_id=None, top_viewed=False):
+    def marketplace(self, limit=20, offset=0, query="", listing_id=None, top_viewed=False, market=None, grading_status=None):
         with self.sessions() as session:
             statement = select(Listing, User).join(User, Listing.seller_id == User.id).where(Listing.status == "published", Listing.publication_approved.is_(True))
+            if market is not None:
+                statement = statement.where(Listing.market == market)
+            if grading_status is not None:
+                statement = statement.where(Listing.grading_status == grading_status)
             if listing_id is not None:
                 statement = statement.where(Listing.id == listing_id)
             if query.strip():
@@ -1015,10 +1066,7 @@ class Database:
             # A new marketplace has no view history; show published listings
             # until the first genuine detail view establishes a ranking.
             if top_viewed:
-                viewed = session.scalar(select(Listing.id).where(
-                    Listing.status == "published", Listing.publication_approved.is_(True),
-                    Listing.view_count > 0,
-                ).limit(1))
+                viewed = session.execute(statement.where(Listing.view_count > 0).limit(1)).first()
                 if viewed is not None:
                     statement = statement.where(Listing.view_count > 0)
             ordering = (Listing.view_count.desc(), Listing.updated_at.desc(), Listing.id) if top_viewed else (Listing.updated_at.desc(), Listing.id)
@@ -1028,9 +1076,12 @@ class Database:
                 record = self._listing_dict(listing)
                 # Explicit public allowlist: no email, scan payload, local notes or credentials.
                 public = {key: record[key] for key in ("id", "title", "description", "price_cents", "currency", "card_name", "set_name", "card_number", "estimated_condition", "rarity_tier", "view_count", "updated_at", "images")}
+                public.update({key: record[key] for key in ("market", "grading_status", "grading_company", "grade", "certification_number")})
+                public["price_tier"] = price_tier(listing.price_cents)
                 ai = listing.ai_result if isinstance(listing.ai_result, dict) else {}
                 verified = ai.get("tcgdex") if isinstance(ai.get("tcgdex"), dict) else {}
                 identified = ai.get("identification") if isinstance(ai.get("identification"), dict) else {}
+                public["market_rarity"] = identified.get("rarity") if listing.market != "pokemon" else listing.rarity_tier
                 types = verified.get("types")
                 public["card_type"] = (types[0] if isinstance(types, list) and types and isinstance(types[0], str) else identified.get("card_type"))
                 public["seller"] = {"display_name": seller.display_name, "tier": seller.seller_tier}

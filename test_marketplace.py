@@ -6,6 +6,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 from auth import create_access_token
 from database import Database, Listing, Order, normalize_rarity, rarity_from_ai_result, utc_now
+from market_rules import price_tier
 from main import app, require_database, require_user
 from reporting import build_sales_csv
 from tracking import TrackingValidationError, classify_tracking_number
@@ -83,6 +84,62 @@ def test_top_viewed_hides_unviewed_and_exposes_verified_type(market):
     assert [listing["id"] for listing in ranked] == ["card"]
     assert ranked[0]["card_type"] == "Fire"
     assert [item["id"] for item in client.get("/api/v1/marketplace?q=Obsidian").json()] == ["card"]
+
+
+@pytest.mark.parametrize(
+    "price_cents,expected",
+    [(0, 1), (8_000, 1), (8_001, 2), (10_000, 2), (10_001, 3),
+     (20_000, 3), (20_001, 4), (25_000, 4), (25_001, 5), (100_000, 5)],
+)
+def test_price_tier_boundaries(price_cents, expected):
+    assert price_tier(price_cents) == expected
+
+
+def test_market_and_grading_filters_preserve_shared_marketplace_features(market):
+    client, db, _, images = market
+    db.upsert_listing("magic-graded", {
+        "market": "magic", "grading_status": "graded", "grading_company": "CGC",
+        "grade": "9.5", "certification_number": "MTG-123", "title": "Black Lotus",
+        "description": "Seller-reported slab label; inspect all photos.", "price_cents": 7_500,
+        "currency": "USD", "card_name": "Black Lotus", "estimated_condition": "Graded 9.5",
+        "status": "draft",
+    }, "seller")
+    db.replace_images("magic-graded", [
+        dict(image, object_key=image["object_key"].replace("card", "magic-graded")) for image in images
+    ], "seller")
+    db.upsert_listing("sports-raw", {
+        "market": "sports", "grading_status": "ungraded", "title": "Rookie Card",
+        "description": "Ungraded sports card with condition disclosure.", "price_cents": 5_000,
+        "currency": "USD", "card_name": "Rookie Card", "estimated_condition": "Near Mint",
+        "status": "draft",
+    }, "seller")
+    db.replace_images("sports-raw", [
+        dict(image, object_key=image["object_key"].replace("card", "sports-raw")) for image in images
+    ], "seller")
+
+    for listing_id in ("card", "magic-graded", "sports-raw"):
+        assert client.post(f"/api/v1/listings/{listing_id}/publish").status_code == 200
+
+    magic = client.get("/api/v1/marketplace?market=magic&grading_status=graded").json()
+    assert [item["id"] for item in magic] == ["magic-graded"]
+    assert magic[0]["grading_company"] == "CGC"
+    assert magic[0]["price_tier"] == 1
+    assert client.get("/api/v1/marketplace?market=magic&grading_status=ungraded").json() == []
+    sports = client.get("/api/v1/marketplace?market=sports&grading_status=ungraded").json()
+    assert [item["id"] for item in sports] == ["sports-raw"]
+    pokemon = client.get("/api/v1/marketplace?market=pokemon&grading_status=ungraded").json()
+    assert [item["id"] for item in pokemon] == ["card"]
+
+
+def test_graded_listing_requires_complete_slab_label(market):
+    client, db, _, _ = market
+    db.upsert_listing("card", {
+        "market": "sports", "grading_status": "graded", "grading_company": "PSA",
+        "grade": "10", "certification_number": None,
+    }, "seller")
+    response = client.post("/api/v1/listings/card/publish")
+    assert response.status_code == 422
+    assert "certification number" in response.json()["detail"]
 
 
 @pytest.mark.parametrize("field,value", [("title", "  "), ("description", ""), ("card_name", None), ("estimated_condition", ""), ("price_cents", 0), ("price_cents", 8001), ("currency", "EUR")])

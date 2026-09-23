@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import random
+from copy import deepcopy
 from uuid import uuid4
 
 import httpx
@@ -233,6 +234,49 @@ response schema.
 """
 
 
+def scan_configuration(market="pokemon", grading_status="ungraded"):
+    if market not in {"pokemon", "magic", "sports"} or grading_status not in {"graded", "ungraded"}:
+        raise ValueError("Invalid scan category")
+    schema = deepcopy(COMBINED_SCAN_SCHEMA)
+    identity = schema["properties"]["identification"]
+    extra = ["grading_company", "grade", "certification_number"]
+    if market == "sports":
+        extra += ["sport", "player", "team", "year", "manufacturer", "parallel", "serial_number"]
+    for field in extra:
+        identity["properties"][field] = {"type": ["string", "null"]}
+        identity["required"].append(field)
+    prompt = COMBINED_SCAN_PROMPT
+    if market != "pokemon":
+        identity["properties"]["rarity"] = {"type": ["string", "null"]}
+        focus = (
+            "Identify this Magic: The Gathering card: name, set, collector number, language, "
+            "foil/printing variant, printed rarity and card type. Do not apply Pokémon rarity or energy types."
+            if market == "magic" else
+            "Identify this sports trading card: athlete/player, sport, team, year, manufacturer, set, "
+            "card number, parallel and visible serial number. Use the athlete/card title as name. "
+            "Use the sport as card_type. Record rarity only if supported by printed evidence, not value. "
+            "Do not invent rookie, autograph, memorabilia, print-run or rarity claims."
+        )
+        prompt = (
+            "You are PokeMarket's single-pass card scanner. All photos depict ONE card. " + focus +
+            " Return tcgdex_id as null. No external catalog or certificate verification has been performed. "
+            "Never invent missing identification fields; use null and lower confidence.\nCondition:\n" +
+            COMBINED_SCAN_PROMPT.split("Condition:\n", 1)[1]
+        )
+    if grading_status == "graded":
+        prompt += """\nThis is a GRADED card in a slab. Read grading_company, grade and
+certification_number exactly from the label; use null when obscured. A readable
+label is NOT verified certification. Never assert the slab, label, autograph or
+card is authentic. Assess visible slab damage, tampering and obscured areas.
+Do not assign a new raw-card grade through plastic or override the label grade.
+Do not mistake slab scratches for card damage. Describe limitations explicitly.
+Never instruct the seller to open or remove the card from its slab.
+"""
+    else:
+        prompt += "\nThis is UNGRADED. Return grading_company, grade and certification_number as null."
+    return prompt, schema
+
+
 class StubProvider:
     name = "stub"
 
@@ -274,7 +318,7 @@ class StubProvider:
             "warnings": ["AI_PROVIDER is stub."],
         }
 
-    async def analyze(self, images):
+    async def analyze(self, images, market="pokemon", grading_status="ungraded"):
         identification = await self.identify(images)
         assessment = await self.assess(images, identification, None)
         return {"identification": identification, **assessment}
@@ -459,11 +503,12 @@ class GeminiProvider:
             images,
         )
 
-    async def analyze(self, images):
+    async def analyze(self, images, market="pokemon", grading_status="ungraded"):
         """Identify and grade with one image-bearing Gemini request."""
+        prompt, schema = scan_configuration(market, grading_status)
         return await self._generate_json(
-            COMBINED_SCAN_PROMPT,
-            COMBINED_SCAN_SCHEMA,
+            prompt,
+            schema,
             images,
         )
 

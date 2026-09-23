@@ -5,6 +5,9 @@ import re
 
 from pydantic import BaseModel, Field, field_validator
 
+Market = Literal["pokemon", "magic", "sports"]
+GradingStatus = Literal["graded", "ungraded"]
+
 class HealthResponse(BaseModel):
     status: str
     service: str
@@ -203,6 +206,8 @@ class AIAnalysisResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 class ScanAnalysisResponse(BaseModel):
+    market: Market = "pokemon"
+    grading_status: GradingStatus = "ungraded"
     scan_id: str
     status: str
     provider: str
@@ -213,6 +218,8 @@ class ScanAnalysisResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 class ScanJobRequest(BaseModel):
+    market: Market = "pokemon"
+    grading_status: GradingStatus = "ungraded"
     listing_id: str = Field(min_length=1, max_length=64)
     include_condition: bool = True
     include_authenticity: bool = True
@@ -278,6 +285,11 @@ class DirectUploadCompleteRequest(BaseModel):
     images: list[DirectUploadCompleteItem] = Field(min_length=4, max_length=9)
 
 class ListingUpsertRequest(BaseModel):
+    market: Market = "pokemon"
+    grading_status: GradingStatus = "ungraded"
+    grading_company: str | None = Field(default=None, max_length=64)
+    grade: str | None = Field(default=None, max_length=32)
+    certification_number: str | None = Field(default=None, max_length=128)
     scan_id: str | None = Field(default=None, max_length=64)
     status: Literal["draft", "published", "sold", "archived"] = "draft"
     title: str | None = Field(default=None, max_length=300)
@@ -308,6 +320,11 @@ class ListingImageRecord(BaseModel):
     url: str | None = None
 
 class ListingResponse(BaseModel):
+    market: Market = "pokemon"
+    grading_status: GradingStatus = "ungraded"
+    grading_company: str | None = None
+    grade: str | None = None
+    certification_number: str | None = None
     id: str
     seller_id: str
     scan_id: str | None = None

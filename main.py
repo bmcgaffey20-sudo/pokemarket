@@ -6,6 +6,7 @@ import logging
 import traceback
 import uuid
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request
@@ -84,7 +85,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.17.0-popular-home")
+app = FastAPI(title=settings.app_name, version="2.18.0-multi-market")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -247,7 +248,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.17.0-popular-home",
+        version="2.18.0-multi-market",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -434,7 +435,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.17.0-popular-home",
+        "service_version": "2.18.0-multi-market",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -626,13 +627,15 @@ async def perform_scan_analysis(
     include_condition=True,
     include_authenticity=True,
     scan_id=None,
+    market="pokemon",
+    grading_status="ungraded",
 ):
     try:
         provider = get_ai_provider(settings)
         # Identification, condition and authenticity share one image-bearing
         # request. This preserves the complete evidence set while avoiding a
         # second Base64 copy of every photograph leaving Render.
-        combined = await provider.analyze(images)
+        combined = await provider.analyze(images, market=market, grading_status=grading_status)
 
     except GeminiUnavailableError:
         # The durable worker handles capacity retry scheduling. Keep this typed
@@ -675,11 +678,12 @@ async def perform_scan_analysis(
     match = None
 
     try:
-        raw_match, match_method = await tcgdex.resolve_candidate(
-            identification.get("name"),
-            identification.get("number"),
-            identification.get("tcgdex_id"),
-        )
+        if market == "pokemon":
+            raw_match, match_method = await tcgdex.resolve_candidate(
+                identification.get("name"), identification.get("number"), identification.get("tcgdex_id"),
+            )
+        else:
+            raw_match, match_method = None, "not_configured_for_market"
         match = as_plain_dict(raw_match)
         if match:
             identification["verification_method"] = match_method
@@ -695,8 +699,11 @@ async def perform_scan_analysis(
         )
 
     identification["verification_status"] = (
-        "matched_tcgdex" if match else "not_verified"
+        "matched_tcgdex" if match else "not_verified" if market == "pokemon" else "visual_identification_only"
     )
+    if market != "pokemon":
+        identification["tcgdex_id"] = None
+        identification.pop("tcgdex_verified_id", None)
 
     if match:
         verified_id = match.get("id")
@@ -706,15 +713,23 @@ async def perform_scan_analysis(
         if isinstance(types, list) and types and isinstance(types[0], str):
             identification["card_type"] = types[0]
     else:
-        warnings.append(
-            "No sufficiently strong TCGdex match was established."
+        warnings.append("No sufficiently strong TCGdex match was established." if market == "pokemon" else
+                        "Visual identification only: no external catalog or certification verification is configured for this market.")
+
+    if market == "pokemon":
+        identification["rarity"] = normalize_rarity(
+            (match or {}).get("rarity") or identification.get("rarity") or identification.get("variant")
         )
 
-    identification["rarity"] = normalize_rarity(
-        (match or {}).get("rarity") or identification.get("rarity") or identification.get("variant")
-    )
-
-    condition = apply_grading_safeguards(condition, images)
+    if grading_status == "graded":
+        label = " ".join(str(identification.get(key) or "").strip() for key in ("grading_company", "grade")).strip()
+        condition["estimated_condition"] = f"Graded — {label}" if label else "Graded — review label"
+        warnings.append("Grading label is seller/AI-read, not certificate-verified. Inspect slab and certification independently.")
+        authenticity["manual_review_recommended"] = True
+    else:
+        condition = apply_grading_safeguards(condition, images)
+        for field in ("grading_company", "grade", "certification_number"):
+            identification[field] = None
     authenticity["confidence"] = normalize_confidence(
         authenticity.get("confidence")
     )
@@ -732,6 +747,8 @@ async def perform_scan_analysis(
     )
 
     return ScanAnalysisResponse(
+        market=market,
+        grading_status=grading_status,
         scan_id=scan_id or new_scan_id(),
         status="complete",
         provider=provider.name,
@@ -748,6 +765,8 @@ async def analyze_scan(
     files: list[UploadFile] = File(...),
     include_condition: bool = Form(True),
     include_authenticity: bool = Form(True),
+    market: Literal["pokemon", "magic", "sports"] = Form("pokemon"),
+    grading_status: Literal["graded", "ungraded"] = Form("ungraded"),
     _scan_slot=Depends(acquire_scan_slot),
     _current_user=Depends(require_user),
 ):
@@ -758,6 +777,8 @@ async def analyze_scan(
             images,
             include_condition=include_condition,
             include_authenticity=include_authenticity,
+            market=market,
+            grading_status=grading_status,
         )
     except GeminiUnavailableError as exc:
         raise HTTPException(503, str(exc)) from exc
@@ -935,6 +956,8 @@ async def scan_worker_loop():
                     include_condition=job["include_condition"],
                     include_authenticity=job["include_authenticity"],
                     scan_id=job["listing_id"],
+                    market=job["market"],
+                    grading_status=job["grading_status"],
                 )
             await asyncio.to_thread(
                 database.finish_scan_job,
@@ -1025,9 +1048,13 @@ async def queue_scan_job(
             current_user["id"],
             payload.include_condition,
             payload.include_authenticity,
+            payload.market,
+            payload.grading_status,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except ListingValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
     except ListingOwnershipError as exc:
         raise HTTPException(404, str(exc)) from exc
     except DatabaseOperationError as exc:
@@ -1197,18 +1224,18 @@ def public_image_urls(record):
 
 
 @app.get("/api/v1/marketplace")
-async def browse_marketplace(limit: int = 20, offset: int = 0, q: str = "", database=Depends(require_database)):
+async def browse_marketplace(limit: int = 20, offset: int = 0, q: str = "", market: Literal["pokemon", "magic", "sports"] | None = None, grading_status: Literal["graded", "ungraded"] | None = None, database=Depends(require_database)):
     if not 1 <= limit <= 50 or offset < 0 or len(q) > 200:
         raise HTTPException(400, "Invalid pagination or search query.")
-    records = await asyncio.to_thread(database.marketplace, limit, offset, q)
+    records = await asyncio.to_thread(database.marketplace, limit, offset, q, market=market, grading_status=grading_status)
     return [public_image_urls(record) for record in records]
 
 
 @app.get("/api/v1/marketplace/top")
-async def top_viewed_marketplace(limit: int = 20, database=Depends(require_database)):
+async def top_viewed_marketplace(limit: int = 20, market: Literal["pokemon", "magic", "sports"] | None = None, grading_status: Literal["graded", "ungraded"] | None = None, database=Depends(require_database)):
     if not 1 <= limit <= 25:
         raise HTTPException(400, "limit must be between 1 and 25.")
-    records = await asyncio.to_thread(database.marketplace, limit, 0, "", None, True)
+    records = await asyncio.to_thread(database.marketplace, limit, 0, "", None, True, market, grading_status)
     return [public_image_urls(record) for record in records]
 
 

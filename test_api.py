@@ -7,6 +7,7 @@ from sqlalchemy import inspect
 
 from fastapi.testclient import TestClient
 from auth import create_access_token, decode_access_token, hash_password, verify_password
+from ai import scan_configuration
 from database import Database, normalize_database_url
 from main import app, apply_grading_safeguards, read_images, require_database, settings
 from storage import R2Storage
@@ -16,9 +17,31 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.17.0-popular-home"
+    assert r.json()["version"] == "2.18.0-multi-market"
     assert r.json()["database"] in {"not_configured", "connected"}
     assert r.json()["auth"] in {"not_configured", "configured"}
+
+
+@pytest.mark.parametrize("market", ["pokemon", "magic", "sports"])
+@pytest.mark.parametrize("grading_status", ["graded", "ungraded"])
+def test_scan_configuration_covers_each_market_and_grading_path(market, grading_status):
+    prompt, schema = scan_configuration(market, grading_status)
+    identity = schema["properties"]["identification"]
+    assert "grading_company" in identity["properties"]
+    assert "grade" in identity["properties"]
+    assert "certification_number" in identity["properties"]
+    if market == "sports":
+        assert {"sport", "player", "team", "year", "manufacturer", "parallel", "serial_number"} <= set(identity["properties"])
+    if market == "pokemon":
+        assert "TCGdex" in prompt
+    else:
+        assert "tcgdex_id as null" in prompt
+    assert ("GRADED card" in prompt) is (grading_status == "graded")
+
+
+def test_scan_configuration_rejects_unknown_category():
+    with pytest.raises(ValueError):
+        scan_configuration("unknown", "ungraded")
 
 
 def test_connect_return_pages_reopen_android_app():
