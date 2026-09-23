@@ -535,8 +535,9 @@ def test_tracking_number_cannot_be_reused(market):
     with pytest.raises(Exception, match="already attached"):
         db.set_tracking(second["id"], "seller", "1Z999AA10123456784", "UPS")
 
-def test_front_and_back_suffice_for_publication(market):
+def test_front_and_back_alone_cannot_publish(market):
     client, db, _, images = market
     db.replace_images("card", [images[0], images[-1]], "seller")
+    assert client.post("/api/v1/listings/card/publish").status_code == 422
+    db.replace_images("card", images, "seller")
     assert client.post("/api/v1/listings/card/publish").status_code == 200
-    assert len(client.get("/api/v1/marketplace/card").json()["images"]) == 2
