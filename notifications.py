@@ -9,6 +9,8 @@ logger = logging.getLogger("pokemarket.notifications")
 
 async def send_push(settings, database, user_ids, title, body, data=None):
     """Send an optional FCM notification without blocking marketplace actions."""
+    from alerts import record_notifications
+    await asyncio.to_thread(record_notifications, database, user_ids, title, body, data or {})
     if not settings.firebase_configured:
         return 0
     tokens = await asyncio.to_thread(database.device_tokens_for_users, user_ids)
