@@ -17,7 +17,7 @@ client = TestClient(app)
 def test_health():
     r = client.get("/api/v1/health")
     assert r.status_code == 200
-    assert r.json()["version"] == "2.19.2-photo-gallery"
+    assert r.json()["version"] == "2.20.0-user-profiles"
     assert r.json()["database"] in {"not_configured", "connected"}
     assert r.json()["auth"] in {"not_configured", "configured"}
 

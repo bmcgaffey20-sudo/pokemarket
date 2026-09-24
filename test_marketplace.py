@@ -47,7 +47,7 @@ def test_publish_browse_withdraw_and_privacy(market):
     assert client.get("/api/v1/marketplace/top?limit=20").json()[0]["view_count"] == 0
     public = client.get("/api/v1/marketplace/card").json()
     assert public["title"] == "Dracozolt VMAX"
-    assert public["seller"] == {"display_name": "Seller", "tier": 1}
+    assert public["seller"] == {"id": "seller", "display_name": "Seller", "tier": 1}
     assert not {"seller_id", "scan_id", "ai_result", "email", "password_hash"} & public.keys()
     assert set(public["images"][0]) == {"label", "url"}
     assert public["view_count"] == 1

@@ -8,6 +8,8 @@ from sqlalchemy import select
 import main
 from database import Database, Listing, Order
 from community import Message, Attachment
+from community import membership_age
+from datetime import date
 
 
 @pytest.fixture
@@ -149,3 +151,21 @@ def test_message_pagination_and_empty_validation(community):
     messages = client.get(f"/api/v1/messages/{chat}").json()["messages"]
     earlier = client.get(f"/api/v1/messages/{chat}?before={messages[-1]['id']}").json()["messages"]
     assert [m["body"] for m in earlier] == ["0", "1"]
+
+
+def test_profile_counts_privacy_and_membership(community):
+    client, db, actor, _ = community
+    p = client.get("/api/v1/users/seller/profile").json()
+    assert p["sells_without_incident"] == 1
+    assert p["buys_without_incident"] == 0
+    assert p["seller_rating"] is None
+    assert not {"email", "shipping_name", "password_hash", "stripe_account_id"} & p.keys()
+    assert client.get("/api/v1/users/missing/profile").status_code == 404
+    assert client.post("/api/v1/orders/order/feedback", json={"rating": 4}).status_code == 200
+    assert client.get("/api/v1/users/seller/profile").json()["seller_rating"] == 4
+    with db.sessions.begin() as session:
+        session.get(Order, "order").return_reason = "not_as_described"
+    assert client.get("/api/v1/users/seller/profile").json()["sells_without_incident"] == 0
+    assert client.get("/api/v1/users/buyer/profile").json()["buys_without_incident"] == 0
+    assert membership_age(date(2024, 2, 29), date(2025, 3, 1)) == {"years": 1, "months": 0, "days": 1}
+    assert membership_age(date(2025, 1, 31), date(2025, 2, 28)) == {"years": 0, "months": 1, "days": 0}

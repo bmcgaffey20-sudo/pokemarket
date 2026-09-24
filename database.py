@@ -1086,7 +1086,7 @@ class Database:
                 public["market_rarity"] = identified.get("rarity") if listing.market != "pokemon" else listing.rarity_tier
                 types = verified.get("types")
                 public["card_type"] = (types[0] if isinstance(types, list) and types and isinstance(types[0], str) else identified.get("card_type"))
-                public["seller"] = {"display_name": seller.display_name, "tier": seller.seller_tier}
+                public["seller"] = {"id": seller.id, "display_name": seller.display_name, "tier": seller.seller_tier}
                 results.append(public)
             return results
 

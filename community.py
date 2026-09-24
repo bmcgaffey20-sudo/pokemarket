@@ -3,6 +3,7 @@ from datetime import timedelta, timezone
 from uuid import uuid4
 from io import BytesIO
 from copy import copy
+from calendar import monthrange
 
 from fastapi import Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
@@ -101,6 +102,18 @@ def feedback_dict(row):
                 created_at=row.created_at.isoformat())
 
 
+def membership_age(joined, today):
+    """Calendar years/months/days, including leap-day and month-end joins."""
+    today = max(joined, today)
+    months = (today.year - joined.year) * 12 + today.month - joined.month
+    def shifted(n):
+        year, month = divmod(joined.year * 12 + joined.month - 1 + n, 12)
+        return joined.replace(year=year, month=month + 1, day=min(joined.day, monthrange(year, month + 1)[1]))
+    if shifted(months) > today:
+        months -= 1
+    return {"years": months // 12, "months": months % 12, "days": (today - shifted(months)).days}
+
+
 def cleanup_message_uploads(db, settings, storage_factory):
     """Remove abandoned upload objects and tickets; sent photos are retained."""
     if not settings.r2_message_bucket_name:
@@ -116,6 +129,26 @@ def cleanup_message_uploads(db, settings, storage_factory):
 
 
 def install_community(app, settings, require_database, require_user, storage_factory):
+    @app.get("/api/v1/users/{user_id}/profile")
+    def public_profile(user_id: str, offset: int = 0, db=Depends(require_database)):
+        if offset < 0:
+            raise HTTPException(400, "Invalid page.")
+        with db.sessions() as session:
+            user = session.get(User, user_id)
+            if user is None:
+                raise HTTPException(404, "Profile not found.")
+            def incident_free(column):
+                return session.scalar(select(func.count()).select_from(Order).where(column == user_id,
+                    Order.status == "completed", Order.return_reason.is_(None), Order.buyer_id != Order.seller_id))
+            filters = (Feedback.recipient_id == user_id, Feedback.recipient_role == "seller")
+            count, average = session.execute(select(func.count(Feedback.id), func.avg(Feedback.rating)).where(*filters)).one()
+            rows = session.scalars(select(Feedback).where(*filters).order_by(Feedback.created_at.desc(), Feedback.id).offset(offset).limit(20)).all()
+            return dict(id=user.id, display_name=user.display_name, seller_tier=user.seller_tier,
+                member_since=user.created_at.date().isoformat(), membership=membership_age(user.created_at.date(), utc_now().date()),
+                buys_without_incident=incident_free(Order.buyer_id), sells_without_incident=incident_free(Order.seller_id),
+                seller_rating=round(float(average), 2) if average else None, seller_rating_count=count,
+                reviews=[feedback_dict(row) for row in rows])
+
     original_storage_factory = storage_factory
     def private_storage():
         if not settings.r2_message_bucket_name:
@@ -157,7 +190,7 @@ def install_community(app, settings, require_database, require_user, storage_fac
             result = []
             for chat in chats:
                 other = session.get(User, chat.seller_id if chat.buyer_id == user["id"] else chat.buyer_id)
-                result.append(dict(id=chat.id, title=chat.title, other_name=other.display_name if other else "Former user", updated_at=chat.updated_at.isoformat()))
+                result.append(dict(id=chat.id, title=chat.title, other_id=other.id if other else None, other_name=other.display_name if other else "Former user", updated_at=chat.updated_at.isoformat()))
             return result
 
     @app.get("/api/v1/messages/{conversation_id}")
@@ -176,7 +209,7 @@ def install_community(app, settings, require_database, require_user, storage_fac
                                    created_at=row.created_at.isoformat()))
             other_id = chat.seller_id if chat.buyer_id == user["id"] else chat.buyer_id
             other = session.get(User, other_id)
-            return dict(title=chat.title, other_name=other.display_name if other else "Former user", messages=result,
+            return dict(title=chat.title, other_id=other_id, other_name=other.display_name if other else "Former user", messages=result,
                         blocked=blocked(session, chat), blocked_by_me=session.get(UserBlock, (user["id"], other_id)) is not None,
                         next_before=rows[-1].id if len(rows) == 50 else None)
 
