@@ -86,7 +86,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.19.1-listing-thumbnails")
+app = FastAPI(title=settings.app_name, version="2.19.2-photo-gallery")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -249,7 +249,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.19.1-listing-thumbnails",
+        version="2.19.2-photo-gallery",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -436,7 +436,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.19.1-listing-thumbnails",
+        "service_version": "2.19.2-photo-gallery",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -1222,17 +1222,20 @@ def public_image_urls(record):
 
 
 @app.get("/api/v1/marketplace/{listing_id}/thumbnail")
-async def listing_thumbnail(listing_id: str, database=Depends(require_database)):
+async def listing_thumbnail(listing_id: str, label: str | None = None, original: bool = False, database=Depends(require_database)):
     records = await asyncio.to_thread(database.marketplace, 1, 0, "", listing_id)
     if not records:
         raise HTTPException(404, "Published listing not found.")
     images = records[0].get("images", [])
-    photo = next((image for image in images if image.get("label") == "required_front_straight"), None)
-    photo = photo or next(iter(images), None)
+    photo = next((image for image in images if image.get("label") == (label or "required_front_straight")), None)
+    if label is None:
+        photo = photo or next(iter(images), None)
     if not photo:
         raise HTTPException(404, "Listing photo is unavailable.")
     try:
-        url = await asyncio.to_thread(get_r2_storage().listing_thumbnail, photo["object_key"], settings.max_image_bytes)
+        storage = get_r2_storage()
+        url = (await asyncio.to_thread(storage.presign_object, photo["object_key"]) if original else
+               await asyncio.to_thread(storage.listing_thumbnail, photo["object_key"], settings.max_image_bytes))
     except Exception:
         logger.exception("Listing preview generation failed for %s", listing_id)
         raise HTTPException(503, "Photo preview could not load. Please retry.")

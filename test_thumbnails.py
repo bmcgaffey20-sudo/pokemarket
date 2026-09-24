@@ -21,6 +21,14 @@ def test_preview_prefers_top_center_and_requires_publication(market, monkeypatch
     assert response.status_code == 307
     assert response.headers["location"] == "https://example.com/preview.jpg"
     assert requested == ["listings/card/front_straight"]
+    response = client.get("/api/v1/marketplace/card/thumbnail?label=required_back", follow_redirects=False)
+    assert response.status_code == 307
+    assert requested[-1] == "listings/card/back"
+    assert client.get("/api/v1/marketplace/card/thumbnail?label=not-a-photo").status_code == 404
+    response = client.get("/api/v1/marketplace/card/thumbnail?label=required_back&original=true", follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"] == "https://example.com/original"
+    assert len(requested) == 2
     client.post("/api/v1/listings/card/unpublish")
     assert client.get("/api/v1/marketplace/card/thumbnail").status_code == 404
 
