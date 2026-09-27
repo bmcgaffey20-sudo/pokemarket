@@ -754,6 +754,8 @@ class Database:
     def ensure_listing_owner(self, listing_id, seller_id, create=False):
         try:
             with self.sessions.begin() as session:
+                from account_controls import require_active_transaction
+                require_active_transaction(session, seller_id)
                 listing = session.get(Listing, listing_id)
                 if listing is None:
                     if not create:
@@ -772,6 +774,8 @@ class Database:
     def replace_images(self, listing_id, stored_images, seller_id):
         try:
             with self.sessions.begin() as session:
+                from account_controls import require_active_transaction
+                require_active_transaction(session, seller_id)
                 listing = session.get(Listing, listing_id, with_for_update=True)
                 if listing is None:
                     listing = Listing(id=listing_id, seller_id=seller_id)
@@ -821,6 +825,8 @@ class Database:
     def upsert_listing(self, listing_id, values, seller_id):
         try:
             with self.sessions.begin() as session:
+                from account_controls import require_active_transaction
+                require_active_transaction(session, seller_id)
                 listing = session.get(Listing, listing_id, with_for_update=True)
                 if listing is None:
                     listing = Listing(id=listing_id, seller_id=seller_id)
@@ -949,6 +955,8 @@ class Database:
     def create_scan_job(self, job_id, listing_id, user_id, include_condition=True, include_authenticity=True, market="pokemon", grading_status="ungraded"):
         try:
             with self.sessions.begin() as session:
+                from account_controls import require_active_transaction
+                require_active_transaction(session, user_id)
                 listing = session.get(Listing, listing_id)
                 if listing is None or listing.seller_id != user_id or not listing.photos_persisted:
                     raise ListingOwnershipError("Listing photos are not available for analysis.")
@@ -1033,6 +1041,8 @@ class Database:
 
     def set_publication(self, listing_id, seller_id, publish):
         with self.sessions.begin() as session:
+            from account_controls import require_active_transaction
+            require_active_transaction(session, seller_id)
             listing = session.get(Listing, listing_id, with_for_update=True)
             if listing is None or listing.seller_id != seller_id:
                 raise ListingOwnershipError("Listing not found.")
@@ -1254,6 +1264,10 @@ class Database:
     def create_pending_order(self, order_id, listing_id, buyer_id, commission_percent, shipping_cents=0):
         """Create a checkout attempt without reserving the one-of-one listing."""
         with self.sessions.begin() as session:
+            from account_controls import require_active_transaction
+            seller_id = session.scalar(select(Listing.seller_id).where(Listing.id == listing_id))
+            for uid in sorted({buyer_id, seller_id} - {None}):
+                require_active_transaction(session, uid)
             listing = session.get(Listing, listing_id, with_for_update=True)
             if listing is None or listing.status != "published" or not listing.publication_approved:
                 raise ListingValidationError("This card is no longer available.")
@@ -1377,7 +1391,7 @@ class Database:
             order = session.execute(
                 select(Order).where(Order.stripe_checkout_session_id == session_id).with_for_update()
             ).scalar_one_or_none()
-            if order is None:
+            if order is None or order.pii_redacted_at is not None:
                 return None
             address = shipping.get("address") or {}
             order.shipping_name = (shipping.get("name") or "").strip() or None
@@ -1804,7 +1818,8 @@ class Database:
         cutoff = (now or utc_now()) - timedelta(days=retention_days)
         fields = ("shipping_name", "shipping_line1", "shipping_line2", "shipping_city", "shipping_state", "shipping_postal_code", "shipping_country", "seller_shipping_name", "seller_shipping_line1", "seller_shipping_line2", "seller_shipping_city", "seller_shipping_state", "seller_shipping_postal_code", "seller_shipping_country")
         with self.sessions.begin() as session:
-            orders = session.execute(select(Order).where(Order.pii_redacted_at.is_(None), func.coalesce(Order.paid_at, Order.created_at) < cutoff, Order.status.not_in(("pending_payment", "canceled")))).scalars().all()
+            # Keep fulfillment data while any payment, delivery or dispute is unresolved.
+            orders = session.execute(select(Order).where(Order.pii_redacted_at.is_(None), func.coalesce(Order.completed_at, Order.updated_at) < cutoff, or_(and_(Order.status == "completed", Order.payout_status == "paid"), Order.status == "refunded"))).scalars().all()
             for order in orders:
                 for field in fields:
                     setattr(order, field, None)

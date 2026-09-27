@@ -131,6 +131,9 @@ def cleanup_message_uploads(db, settings, storage_factory):
 def install_community(app, settings, require_database, require_user, storage_factory):
     @app.get("/api/v1/users/{user_id}/profile")
     def public_profile(user_id: str, offset: int = 0, db=Depends(require_database)):
+        from account_controls import status
+        if status(db, user_id)["state"] == "deleted":
+            raise HTTPException(404, "Profile not found.")
         if offset < 0:
             raise HTTPException(400, "Invalid page.")
         with db.sessions() as session:

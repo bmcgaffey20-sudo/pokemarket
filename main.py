@@ -72,13 +72,14 @@ from schemas import (
     SellerAddressResponse,
 )
 from notifications import send_push
-from reporting import completed_week, send_weekly_sales_report
+from reporting import completed_week, completed_month, send_weekly_sales_report
 from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
 from recovery import install_recovery, limit_auth, send_action_email
 from tracking import TrackingValidationError, classify_tracking_number
 from community import install_community, cleanup_message_uploads
 from alerts import install_alerts
+from account_controls import install_account_controls, enforce, process_deletions, ledger_rows, sync_ledger
 
 
 settings = get_settings()
@@ -87,7 +88,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.21.0-activity-badges")
+app = FastAPI(title=settings.app_name, version="2.22.0-account-controls")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -149,6 +150,7 @@ async def require_database():
 
 
 async def require_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(auth_scheme),
     database=Depends(require_database),
 ):
@@ -165,6 +167,7 @@ async def require_user(
         raise HTTPException(401, "Account no longer exists.", headers={"WWW-Authenticate": "Bearer"})
     if payload.get("ver", 0) != user["session_version"]:
         raise HTTPException(401, "Your session was invalidated. Sign in again.", headers={"WWW-Authenticate": "Bearer"})
+    await asyncio.to_thread(enforce, database, user["id"], request)
     # ADMIN_EMAILS is the source of truth. Synchronizing both promotion and
     # removal prevents an account from retaining administrator access after it
     # is removed from the Render environment variable.
@@ -250,7 +253,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.21.0-activity-badges",
+        version="2.22.0-account-controls",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -437,7 +440,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.21.0-activity-badges",
+        "service_version": "2.22.0-account-controls",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -452,6 +455,7 @@ async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(requ
 install_recovery(app, settings, require_database, require_user)
 install_community(app, settings, require_database, require_user, lambda: get_r2_storage())
 install_alerts(app, require_database, require_user)
+install_account_controls(app, settings, require_database, require_user, require_admin)
 
 
 @app.get("/api/v1/cards/search", response_model=CardSearchResponse)
@@ -893,13 +897,16 @@ async def process_operational_safeguards(database):
         if marked:
             await send_push(settings, database, [reminder["user_id"]], title, f"{reminder['days']} day reminder: {body}", {"page": "orders", "order_id": reminder["order_id"]})
 
+    await asyncio.to_thread(sync_ledger, database)
+    await asyncio.to_thread(process_deletions, database, settings, get_r2_storage)
     if settings.email_configured and settings.admin_report_recipient:
-        period_start, period_end = completed_week()
-        sent = await asyncio.to_thread(database.report_already_sent, period_start, period_end)
-        if not sent:
-            rows = await asyncio.to_thread(database.list_admin_sales, 10_000, 0, "", period_start, period_end)
-            subject = await send_weekly_sales_report(settings, rows, period_start, period_end)
-            await asyncio.to_thread(database.record_report_sent, period_start, period_end, settings.admin_report_recipient, subject)
+        for cadence, period in (("Weekly", completed_week()), ("Monthly", completed_month())):
+            period_start, period_end = period
+            sent = await asyncio.to_thread(database.report_already_sent, period_start, period_end)
+            if not sent:
+                rows = await asyncio.to_thread(ledger_rows, database, period_start, period_end)
+                subject = await send_weekly_sales_report(settings, rows, period_start, period_end, cadence)
+                await asyncio.to_thread(database.record_report_sent, period_start, period_end, settings.admin_report_recipient, subject)
 
     await asyncio.to_thread(database.redact_expired_sale_addresses, settings.sale_detail_retention_days)
     await asyncio.to_thread(database.prune_listing_view_deduplication, 90)

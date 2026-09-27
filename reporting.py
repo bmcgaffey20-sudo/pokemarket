@@ -22,6 +22,30 @@ def completed_week(now=None):
     return this_monday - timedelta(days=7), this_monday
 
 
+def completed_month(now=None):
+    now = now or datetime.now(timezone.utc)
+    end = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return (end - timedelta(days=1)).replace(day=1), end
+
+
+def build_retained_csv(rows):
+    from account_controls import FINANCIAL_FIELDS
+    output = io.StringIO(newline="")
+    columns = (*FINANCIAL_FIELDS, "paid_at")
+    writer = csv.DictWriter(output, fieldnames=columns)
+    writer.writeheader()
+    for row in rows:
+        # Protect spreadsheet readers from formula injection, even on identifiers.
+        clean = {}
+        for key in columns:
+            value = row.get(key)
+            if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+                value = "'" + value
+            clean[key] = value
+        writer.writerow(clean)
+    return output.getvalue().encode("utf-8")
+
+
 def _money(cents):
     return f"{int(cents or 0) / 100:.2f}"
 
@@ -55,17 +79,17 @@ def build_sales_csv(rows):
     return output.getvalue().encode("utf-8")
 
 
-async def send_weekly_sales_report(settings, rows, period_start, period_end):
+async def send_weekly_sales_report(settings, rows, period_start, period_end, cadence="Weekly"):
     sender_name, sender_email = parseaddr(settings.email_from or "")
     end_label = (period_end - timedelta(days=1)).strftime("%b %d, %Y")
-    subject = f"PokeMarket Sales Report — {period_start.strftime('%b %d')}–{end_label}"
-    filename = f"pokemarket-sales-{period_start.date()}-to-{(period_end - timedelta(days=1)).date()}.csv"
+    subject = f"Slab Grade {cadence} Sales Report — {period_start.strftime('%b %d, %Y')}–{end_label} UTC"
+    filename = f"slab-grade-{cadence.lower()}-sales-{period_start.date()}-to-{(period_end - timedelta(days=1)).date()}.csv"
     payload = {"Messages": [{
         "From": {"Email": sender_email, "Name": sender_name or "PokeMarket"},
         "To": [{"Email": settings.admin_report_recipient}], "Subject": subject,
-        "TextPart": f"Attached is the PokeMarket sales report for {period_start.date()} through {(period_end - timedelta(days=1)).date()} ({len(rows)} sales). Shipping details are retained in the live admin panel for 30 days.",
+        "TextPart": f"Slab Grade financial report for {period_start.date()} through {(period_end - timedelta(days=1)).date()} UTC ({len(rows)} sales). Amounts are integer cents. Identity is represented by internal IDs; addresses, names, emails and messages are excluded. Status reflects report generation time. Retained records remain accessible in Admin; later refunds and payouts update the ledger.",
         "Attachments": [{"ContentType": "text/csv", "Filename": filename,
-                         "Base64Content": base64.b64encode(build_sales_csv(rows)).decode("ascii")}],
+                         "Base64Content": base64.b64encode(build_retained_csv(rows)).decode("ascii")}],
     }]}
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post("https://api.mailjet.com/v3.1/send", auth=(settings.mailjet_api_key, settings.mailjet_secret_key), json=payload)

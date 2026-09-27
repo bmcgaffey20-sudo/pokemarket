@@ -443,11 +443,13 @@ def test_admin_access_tracks_admin_emails_source_of_truth(market, monkeypatch):
     monkeypatch.setattr(main.settings, "auth_secret", secret)
 
     monkeypatch.setattr(main.settings, "admin_emails", "seller@example.com")
-    promoted = asyncio.run(require_user(credentials=credentials, database=db))
+    from starlette.requests import Request
+    request = Request({"type": "http", "method": "GET", "path": "/api/v1/auth/me"})
+    promoted = asyncio.run(require_user(request=request, credentials=credentials, database=db))
     assert promoted["is_admin"] is True
 
     monkeypatch.setattr(main.settings, "admin_emails", "")
-    removed = asyncio.run(require_user(credentials=credentials, database=db))
+    removed = asyncio.run(require_user(request=request, credentials=credentials, database=db))
     assert removed["is_admin"] is False
 
 
@@ -505,6 +507,12 @@ def test_tracking_validation_admin_sales_report_and_retention(market):
     with db.sessions.begin() as session:
         stored = session.get(Order, order["id"])
         stored.paid_at = utc_now() - timedelta(days=31)
+    assert db.redact_expired_sale_addresses(30) == 0  # Active shipment still needs its address.
+    with db.sessions.begin() as session:
+        stored = session.get(Order, order["id"])
+        stored.status = "completed"
+        stored.payout_status = "paid"
+        stored.completed_at = utc_now() - timedelta(days=31)
     assert db.redact_expired_sale_addresses(30) == 1
     redacted = db.get_admin_sale(order["id"])
     assert redacted["shipping_line1"] is None

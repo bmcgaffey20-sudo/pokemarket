@@ -1,0 +1,13 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Delete your Slab Grade account</title>
+<style>body{font:17px/1.6 system-ui;max-width:650px;margin:40px auto;padding:0 24px;color:#242036}label{display:block;margin-top:16px}input,button{box-sizing:border-box;width:100%;padding:12px;font:inherit}button{margin-top:20px;background:#5541cf;color:white;border:0;border-radius:8px}#result{white-space:pre-wrap}</style>
+<h1>Delete your Slab Grade account</h1><p>For Slab Grade (formerly PokeMarket). This deletes your account and associated personal content once open transactions and scans have finished. Financial records remain for accounting, refunds and disputes. Cloud files are removed through a retry queue. See the <a href="/privacy">privacy policy</a>.</p>
+<p>Existing orders remain accessible while deletion is pending. Need help, or no longer have app access? Email <a href="mailto:bmcgaffey20@gmail.com?subject=Slab%20Grade%20account%20deletion">bmcgaffey20@gmail.com</a> from your registered email to request deletion. Never email your password. Ownership verification may be required.</p>
+<form id="form"><label>Email<input id="email" type="email" autocomplete="username" required></label><label>Password<input id="password" type="password" autocomplete="current-password" required></label><label>Type DELETE to confirm<input id="confirm" pattern="DELETE" required autocomplete="off"></label><button id="submit">Request account deletion</button></form><p id="result" role="status"></p>
+<script>
+document.getElementById('form').addEventListener('submit',async e=>{
+e.preventDefault();const button=document.getElementById('submit');button.disabled=true;
+const password=document.getElementById('password').value;
+try{const login=await fetch('/api/v1/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:document.getElementById('email').value,password})});const auth=await login.json();if(!login.ok)throw new Error(typeof auth.detail==='string'?auth.detail:'Unable to sign in.');
+const response=await fetch('/api/v1/account/delete',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+auth.access_token},body:JSON.stringify({password,confirmation:document.getElementById('confirm').value})});const body=await response.json();if(!response.ok)throw new Error(typeof body.detail==='string'?body.detail:'Deletion request failed.');document.getElementById('result').textContent=body.message;}
+catch(error){document.getElementById('result').textContent=error.message;}finally{document.getElementById('password').value='';button.disabled=false;}
+});</script></html>

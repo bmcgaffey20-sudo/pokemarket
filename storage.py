@@ -246,6 +246,19 @@ class R2Storage:
         if failures:
             raise R2UploadError("Could not delete R2 objects: " + "; ".join(failures))
 
+    def delete_listing_prefix(self, prefix):
+        """Delete only one account-owned listing's originals and derived thumbnails."""
+        import re
+        if not re.fullmatch(r"listings/[A-Za-z0-9_-]+/originals/", prefix):
+            raise R2UploadError("Invalid listing cleanup prefix")
+        # Start from the first page again after deleting it; avoids skipped keys.
+        while True:
+            result = self.client.list_objects_v2(Bucket=self.bucket_name, Prefix=prefix, MaxKeys=100)
+            keys = [item["Key"] for item in result.get("Contents", [])]
+            if not keys:
+                return
+            self.delete_objects(keys)
+
     def presign_object(self, object_key):
         return self.client.generate_presigned_url(
             "get_object",
