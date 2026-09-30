@@ -79,6 +79,9 @@ from tcgdex import TCGdexClient
 from recovery import install_recovery, limit_auth, send_action_email
 from tracking import TrackingValidationError, classify_tracking_number
 from community import install_community, cleanup_message_uploads
+from instant_sales import install_instant
+from message_reports import install_reports
+from admin_profiles import install_admin_profiles
 from account_health import install_health, record_dispute
 from alerts import install_alerts
 from account_controls import install_account_controls, enforce, process_deletions, ledger_rows, sync_ledger
@@ -90,7 +93,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.25.0-account-health")
+app = FastAPI(title=settings.app_name, version="2.27.0-instant-sales")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -207,6 +210,7 @@ async def user_with_stripe_status(user):
     """Return public user data with live Stripe Connect readiness flags."""
     result = dict(user)
     result.update(
+        stripe_status_checked=False,
         stripe_connected=False,
         stripe_details_submitted=False,
         stripe_charges_enabled=False,
@@ -223,6 +227,7 @@ async def user_with_stripe_status(user):
         currently_due = list(requirements.get("currently_due") or [])
         past_due = list(requirements.get("past_due") or [])
         result.update(
+            stripe_status_checked=True,
             stripe_details_submitted=bool(account.get("details_submitted")),
             stripe_charges_enabled=bool(account.get("charges_enabled")),
             stripe_payouts_enabled=bool(account.get("payouts_enabled")),
@@ -255,7 +260,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.25.0-account-health",
+        version="2.27.0-instant-sales",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -442,7 +447,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.25.0-account-health",
+        "service_version": "2.27.0-instant-sales",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -458,6 +463,9 @@ install_recovery(app, settings, require_database, require_user)
 install_community(app, settings, require_database, require_user, lambda: get_r2_storage())
 install_alerts(app, require_database, require_user)
 install_health(app, require_database, require_user, require_admin)
+install_reports(app, require_database, require_user, require_admin)
+install_instant(app, settings, require_database, require_user, require_admin, lambda: require_stripe(), lambda: get_r2_storage())
+install_admin_profiles(app, require_database, require_admin, user_with_stripe_status, lambda: get_r2_storage())
 install_cart(app, settings, require_database, require_user, lambda: require_stripe())
 install_account_controls(app, settings, require_database, require_user, require_admin)
 

@@ -1,3 +1,11 @@
+# Sell Instantly release
+
+Read UPDATE-Sell-Instantly.md for final pricing rules and deployment.
+
+# Admin profiles release
+
+Read UPDATE-Admin-Profiles.md for this release.
+
 # Account Health release
 
 Read UPDATE-Account-Health.md for deployment and metric definitions.

@@ -1333,6 +1333,11 @@ class Database:
                 return {"won": False, "already_processed": True, "order": self._order_dict(order)}
 
             listing = session.get(Listing, order.listing_id, with_for_update=True)
+            # An instant purchase buys the exact reviewed card evidence, not later edits.
+            from instant_sales import InstantOffer, fingerprint, snapshot
+            instant = session.scalar(select(InstantOffer).where(InstantOffer.order_id == order.id))
+            if instant and listing and fingerprint(snapshot(listing)) != instant.fingerprint:
+                listing = None
             if listing and listing.status == "published" and listing.publication_approved:
                 order.status = "paid"
                 order.stripe_payment_intent_id = payment_intent_id
