@@ -72,6 +72,7 @@ from schemas import (
     SellerAddressResponse,
 )
 from notifications import send_push
+from cart import install_cart, cart_webhook
 from reporting import completed_week, completed_month, send_weekly_sales_report
 from storage import R2ConfigurationError, R2Storage, R2UploadError
 from tcgdex import TCGdexClient
@@ -88,7 +89,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.22.0-account-controls")
+app = FastAPI(title=settings.app_name, version="2.24.0-cart-watchlist")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -253,7 +254,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.22.0-account-controls",
+        version="2.24.0-cart-watchlist",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -440,7 +441,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.22.0-account-controls",
+        "service_version": "2.24.0-cart-watchlist",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -455,6 +456,7 @@ async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(requ
 install_recovery(app, settings, require_database, require_user)
 install_community(app, settings, require_database, require_user, lambda: get_r2_storage())
 install_alerts(app, require_database, require_user)
+install_cart(app, settings, require_database, require_user, lambda: require_stripe())
 install_account_controls(app, settings, require_database, require_user, require_admin)
 
 
@@ -835,6 +837,7 @@ async def settle_buyer_refund(order, database):
         refund = await asyncio.to_thread(
             stripe_client.Refund.create,
             payment_intent=order["stripe_payment_intent_id"],
+            amount=order["item_cents"] + order["shipping_cents"],
             metadata={"order_id": order["id"], "reason": "return_confirmation_timeout"},
             idempotency_key=f"pokemarket-return-{order['id']}",
         )
@@ -1643,6 +1646,9 @@ async def create_checkout_session(
     current_user=Depends(require_user),
     database=Depends(require_database),
 ):
+    available = await asyncio.to_thread(database.marketplace, listing_id=payload.listing_id)
+    if not available or int(available[0].get("price_cents") or 0) < 1900:
+        raise HTTPException(409, "Minimum merchandise checkout is $19.00. Add this card to a cart with other items.")
     stripe_client = require_stripe()
     order_id = str(uuid.uuid4())
     try:
@@ -1651,8 +1657,8 @@ async def create_checkout_session(
             order_id,
             payload.listing_id,
             current_user["id"],
-            settings.marketplace_commission_percent,
-            payload.shipping_cents,
+            8,
+            499,
         )
     except ListingValidationError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -1740,6 +1746,8 @@ async def stripe_webhook(
         # funds succeed. They must wait for async_payment_succeeded.
         if event_type == "checkout.session.completed" and checkout.get("payment_status") != "paid":
             return {"received": True}
+        if await cart_webhook(checkout, database, stripe_client, settings, background):
+            return {"received": True}
         payment_intent_id = checkout.get("payment_intent")
         result = await asyncio.to_thread(
             database.claim_order_payment,
@@ -1752,7 +1760,8 @@ async def stripe_webhook(
             if shipping:
                 await asyncio.to_thread(database.save_shipping_details, checkout.get("id"), shipping)
             order = result["order"]
-            background.add_task(send_push, settings, database, [order["seller_id"]], "Card sold", "You received a new PokeMarket order.", {"page": "orders", "order_id": order["id"]})
+            if not result["already_processed"]:
+                background.add_task(send_push, settings, database, [order["seller_id"]], "Card sold", "You received a new order. Provide tracking within 3 business days.", {"page": "orders", "order_id": order["id"]})
         if result and not result["won"] and not result["already_processed"]:
             order = result["order"]
             if not payment_intent_id:
@@ -1893,6 +1902,7 @@ async def confirm_return_received(order_id: str, background: BackgroundTasks, cu
         refund = await asyncio.to_thread(
             stripe_client.Refund.create,
             payment_intent=order["stripe_payment_intent_id"],
+            amount=order["item_cents"] + order["shipping_cents"],
             metadata={"order_id": order_id, "reason": "approved_return"},
             idempotency_key=f"pokemarket-return-{order_id}",
         )

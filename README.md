@@ -40,7 +40,7 @@ The service creates the application tables on first connection, including:
   inflating public view totals; raw IP addresses are never stored.
 - `listing_images`: label, permanent R2 object key, MIME type, byte size, order,
   and whether the image is a defect close-up.
-- `orders`: buyer, seller, listing, Stripe payment state, 4% marketplace
+- `orders`: buyer, seller, listing, Stripe payment state, 8% plus $0.30 per checkout (shipping excluded) marketplace
   commission, delivery-protection hold, and seller payout state.
 - `scan_jobs`: durable queued/processing/completed AI scan state and results.
 - `device_tokens`: account-owned Android Firebase notification tokens.
@@ -77,7 +77,7 @@ Checkout and orders:
 - `POST /api/v1/payments/connect/onboard` creates a Stripe Express seller
   onboarding link. A seller must finish this before buyers can pay.
 - `POST /api/v1/payments/checkout` reserves a published card and creates a
-  Stripe Checkout Session in test mode. The 4% PokeMarket commission is stored
+  Stripe Checkout Session in test mode. The 8% plus $0.30 per checkout (shipping excluded) PokeMarket commission is stored
   on the order; shipping is collected separately and is not counted as seller
   commission.
 - `POST /api/v1/payments/webhook` confirms payment from Stripe's signed

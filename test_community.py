@@ -22,7 +22,7 @@ def community(tmp_path, monkeypatch):
     with db.sessions.begin() as session:
         session.add(Listing(id="listing", seller_id="seller", title="Card", status="published", price_cents=100))
         session.add(Order(id="order", listing_id="listing", buyer_id="buyer", seller_id="seller", status="completed",
-                          item_cents=100, commission_cents=10, seller_amount_cents=90))
+                          item_cents=100, commission_cents=10, seller_amount_cents=90, payout_status="paid"))
     actor = {"name": "buyer"}
     main.app.dependency_overrides[main.require_database] = lambda: db
     main.app.dependency_overrides[main.require_user] = lambda: users[actor["name"]]
@@ -97,6 +97,12 @@ def test_feedback_participants_eligibility_duplicate_and_public_privacy(communit
     with db.sessions.begin() as session: session.get(Order, "order").status = "pending_payment"
     assert client.post("/api/v1/orders/order/feedback", json={"rating": 5}).status_code == 409
     with db.sessions.begin() as session: session.get(Order, "order").status = "refunded"
+    assert client.post("/api/v1/orders/order/feedback", json={"rating": 4}).status_code == 409
+    with db.sessions.begin() as session:
+        session.get(Order, "order").status = "completed"
+        session.get(Order, "order").payout_status = "pending"
+    assert client.post("/api/v1/orders/order/feedback", json={"rating": 4}).status_code == 409
+    with db.sessions.begin() as session: session.get(Order, "order").payout_status = "paid"
     assert client.post("/api/v1/orders/order/feedback", json={"rating": 6}).status_code == 422
     assert client.post("/api/v1/orders/order/feedback", json={"rating": 4, "comment": "Helpful seller"}).status_code == 200
     assert client.post("/api/v1/orders/order/feedback", json={"rating": 1}).status_code == 409
@@ -169,3 +175,20 @@ def test_profile_counts_privacy_and_membership(community):
     assert client.get("/api/v1/users/buyer/profile").json()["buys_without_incident"] == 0
     assert membership_age(date(2024, 2, 29), date(2025, 3, 1)) == {"years": 1, "months": 0, "days": 1}
     assert membership_age(date(2025, 1, 31), date(2025, 2, 28)) == {"years": 0, "months": 1, "days": 0}
+
+
+def test_multi_delete_is_private_idempotent_and_scoped(community):
+    client, db, actor, _ = community
+    chat = start(client)
+    for i in range(3):
+        assert client.post(f'/api/v1/messages/{chat}', json={'client_id':f'delete-{i}','body':f'Message {i}'}).status_code == 200
+    ids = [m['id'] for m in client.get(f'/api/v1/messages/{chat}').json()['messages']]
+    payload = {'message_ids': ids[:2]}
+    assert client.post(f'/api/v1/messages/{chat}/delete', json=payload).status_code == 200
+    assert client.post(f'/api/v1/messages/{chat}/delete', json=payload).status_code == 200
+    assert len(client.get(f'/api/v1/messages/{chat}').json()['messages']) == 1
+    actor['name'] = 'seller'
+    assert len(client.get(f'/api/v1/messages/{chat}').json()['messages']) == 3
+    assert client.post(f'/api/v1/messages/{chat}/delete',json={'message_ids':[9999]}).status_code==404
+    actor['name'] = 'stranger'
+    assert client.post(f'/api/v1/messages/{chat}/delete',json=payload).status_code==404

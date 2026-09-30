@@ -86,6 +86,7 @@ class CheckoutResponse(BaseModel):
     currency: str
 
 class OrderResponse(BaseModel):
+    shipping_due_at: datetime | None = None
     id: str
     listing_id: str
     buyer_id: str

@@ -2,7 +2,7 @@ from fastapi import Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, select, func, or_, update
 from database import Base, utc_now
-from community import Conversation, Message, participant
+from community import Conversation, Message, HiddenMessage, participant
 
 class Notification(Base):
     __tablename__ = "user_notifications"
@@ -40,7 +40,7 @@ def install_alerts(app, require_database, require_user):
                 MessageRead.conversation_id == Message.conversation_id).correlate(Message).scalar_subquery()
             owned = or_(Conversation.buyer_id == uid, Conversation.seller_id == uid)
             messages = session.scalar(select(func.count()).select_from(Message).join(Conversation, Message.conversation_id == Conversation.id).where(
-                owned, Message.sender_id != uid, Message.id > func.coalesce(cursor, 0)))
+                owned, Message.sender_id != uid, Message.id > func.coalesce(cursor, 0), ~Message.id.in_(select(HiddenMessage.message_id).where(HiddenMessage.user_id == uid))))
             notifications = session.scalar(select(func.count()).select_from(Notification).where(Notification.user_id == uid, Notification.is_read.is_(False)))
             latest = session.scalar(select(func.max(Message.id)).join(Conversation, Message.conversation_id == Conversation.id).where(owned)) or 0
             latest_notification = session.scalar(select(func.max(Notification.id)).where(Notification.user_id == uid)) or 0

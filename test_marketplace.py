@@ -263,7 +263,7 @@ def test_order_shipping_delivery_protection_and_completion(market):
     client, db, _, _ = market
     assert client.post("/api/v1/listings/card/publish").status_code == 200
     order = db.create_pending_order("order-lifecycle", "card", "other", 4, shipping_cents=500)
-    assert order["seller_amount_cents"] == 1250 + 500 - 50
+    assert order["seller_amount_cents"] == 1250 + 500 - 130
     db.attach_checkout_session(order["id"], "cs_lifecycle")
     assert db.claim_order_payment("cs_lifecycle", "pi_lifecycle")["won"] is True
 

@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     stripe_secret_key: str | None = None
     stripe_publishable_key: str | None = None
     stripe_webhook_secret: str | None = None
-    marketplace_commission_percent: int = 4
+    marketplace_commission_percent: int = 8
     ebay_commission_percent: int = 1
     seller_hold_days: int = 10
     confirmation_timeout_days: int = 10

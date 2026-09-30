@@ -12,7 +12,16 @@ from sqlalchemy.exc import IntegrityError
 from PIL import Image
 from database import Base, Listing, Order, User, utc_now
 from notifications import send_push
+from shipping_performance import score
 
+
+class HiddenMessage(Base):
+    __tablename__ = "hidden_messages"
+    user_id = Column(String(36), primary_key=True)
+    message_id = Column(Integer, primary_key=True)
+
+class DeleteMessagesInput(BaseModel):
+    message_ids: list[int] = Field(min_length=1, max_length=100)
 
 class Conversation(Base):
     __tablename__ = "conversations"
@@ -146,10 +155,11 @@ def install_community(app, settings, require_database, require_user, storage_fac
             filters = (Feedback.recipient_id == user_id, Feedback.recipient_role == "seller")
             count, average = session.execute(select(func.count(Feedback.id), func.avg(Feedback.rating)).where(*filters)).one()
             rows = session.scalars(select(Feedback).where(*filters).order_by(Feedback.created_at.desc(), Feedback.id).offset(offset).limit(20)).all()
-            return dict(id=user.id, display_name=user.display_name, seller_tier=user.seller_tier,
+            buyer_count, buyer_average = session.execute(select(func.count(Feedback.id), func.avg(Feedback.rating)).where(Feedback.recipient_id == user_id, Feedback.recipient_role == "buyer")).one()
+            return dict(**score(session, user_id), id=user.id, display_name=user.display_name, seller_tier=user.seller_tier,
                 member_since=user.created_at.date().isoformat(), membership=membership_age(user.created_at.date(), utc_now().date()),
                 buys_without_incident=incident_free(Order.buyer_id), sells_without_incident=incident_free(Order.seller_id),
-                seller_rating=round(float(average), 2) if average else None, seller_rating_count=count,
+                buyer_rating=round(float(buyer_average), 2) if buyer_average else None, buyer_rating_count=buyer_count, seller_rating=round(float(average), 2) if average else None, seller_rating_count=count,
                 reviews=[feedback_dict(row) for row in rows])
 
     original_storage_factory = storage_factory
@@ -200,7 +210,7 @@ def install_community(app, settings, require_database, require_user, storage_fac
     def read_chat(conversation_id: str, before: int = 0, user=Depends(require_user), db=Depends(require_database)):
         with db.sessions() as session:
             chat = participant(session, conversation_id, user["id"])
-            stmt = select(Message).where(Message.conversation_id == conversation_id)
+            stmt = select(Message).where(Message.conversation_id == conversation_id, ~Message.id.in_(select(HiddenMessage.message_id).where(HiddenMessage.user_id == user["id"])))
             if before > 0:
                 stmt = stmt.where(Message.id < before)
             rows = session.scalars(stmt.order_by(Message.id.desc()).limit(50)).all()
@@ -215,6 +225,17 @@ def install_community(app, settings, require_database, require_user, storage_fac
             return dict(title=chat.title, other_id=other_id, other_name=other.display_name if other else "Former user", messages=result,
                         blocked=blocked(session, chat), blocked_by_me=session.get(UserBlock, (user["id"], other_id)) is not None,
                         next_before=rows[-1].id if len(rows) == 50 else None)
+
+    @app.post("/api/v1/messages/{conversation_id}/delete")
+    def delete_messages(conversation_id: str, payload: DeleteMessagesInput, user=Depends(require_user), db=Depends(require_database)):
+        with db.sessions.begin() as session:
+            participant(session, conversation_id, user["id"])
+            session.get(User, user["id"], with_for_update=True)
+            rows = session.scalars(select(Message.id).where(Message.conversation_id == conversation_id, Message.id.in_(payload.message_ids))).all()
+            if set(rows) != set(payload.message_ids): raise HTTPException(404, "Message not found in this conversation.")
+            for mid in rows:
+                if not session.get(HiddenMessage, (user["id"], mid)): session.add(HiddenMessage(user_id=user["id"], message_id=mid))
+        return {"status": "deleted", "count": len(rows)}
 
     @app.post("/api/v1/messages/{conversation_id}/block")
     def block_chat(conversation_id: str, user=Depends(require_user), db=Depends(require_database)):
@@ -319,7 +340,7 @@ def install_community(app, settings, require_database, require_user, storage_fac
             if order is None or user["id"] not in (order.buyer_id, order.seller_id):
                 raise HTTPException(404, "Order not found.")
             rows = session.scalars(select(Feedback).where(Feedback.order_id == order_id)).all()
-            return dict(eligible=order.status in ("completed", "refunded"), reviews=[dict(feedback_dict(r), mine=r.author_id == user["id"]) for r in rows])
+            return dict(eligible=order.status == "completed" and order.payout_status == "paid", reviews=[dict(feedback_dict(r), mine=r.author_id == user["id"]) for r in rows])
 
     @app.post("/api/v1/orders/{order_id}/feedback")
     def leave_feedback(order_id: str, payload: FeedbackInput, user=Depends(require_user), db=Depends(require_database)):
@@ -327,8 +348,8 @@ def install_community(app, settings, require_database, require_user, storage_fac
             order = session.get(Order, order_id)
             if order is None or user["id"] not in (order.buyer_id, order.seller_id):
                 raise HTTPException(404, "Order not found.")
-            if order.status not in ("completed", "refunded"):
-                raise HTTPException(409, "Feedback opens after the transaction completes or is refunded.")
+            if (order.status != "completed" or order.payout_status != "paid"):
+                raise HTTPException(409, "Feedback opens after completion and seller payout.")
             recipient = order.seller_id if user["id"] == order.buyer_id else order.buyer_id
             session.add(Feedback(id=str(uuid4()), order_id=order_id, author_id=user["id"], recipient_id=recipient,
                                  recipient_role="seller" if recipient == order.seller_id else "buyer", rating=payload.rating, comment=payload.comment.strip()))

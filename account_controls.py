@@ -201,6 +201,8 @@ def purge_account(db, user_id):
                 session.delete(img)
             session.execute(delete(ScanJob).where(ScanJob.listing_id == listing.id))
             session.execute(delete(ListingView).where(ListingView.listing_id == listing.id))
+            from cart import CollectionItem
+            session.execute(delete(CollectionItem).where(CollectionItem.listing_id == listing.id))
             listing.status = "archived"
             listing.publication_approved = False
             listing.title = "Deleted listing"
@@ -221,6 +223,10 @@ def purge_account(db, user_id):
         session.execute(delete(UserBlock).where(or_(UserBlock.owner_id == user_id, UserBlock.blocked_id == user_id)))
         for model in (Notification, DeviceToken, AccountAction, ScanJob):
             session.execute(delete(model).where(model.user_id == user_id))
+        from cart import CollectionItem
+        from community import HiddenMessage
+        session.execute(delete(CollectionItem).where(CollectionItem.user_id == user_id))
+        session.execute(delete(HiddenMessage).where(HiddenMessage.user_id == user_id))
         user.email = f"deleted-{user.id}@deleted.invalid"
         user.display_name = "Deleted account"
         user.password_hash = user.password_salt = "disabled"

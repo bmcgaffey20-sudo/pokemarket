@@ -58,8 +58,8 @@ def validate_publication(listing, seller):
     for field in ("title", "description", "card_name", "estimated_condition"):
         if not (getattr(listing, field) or "").strip():
             raise ListingValidationError(f"Add {field.replace('_', ' ')} before publishing.")
-    if listing.currency != "USD" or not listing.price_cents or listing.price_cents < 1:
-        raise ListingValidationError("Set a positive USD price before publishing.")
+    if listing.currency != "USD" or not listing.price_cents or listing.price_cents < 900:
+        raise ListingValidationError("The minimum listing price is $9.00 USD.")
     if seller.max_listing_cents is not None and listing.price_cents > seller.max_listing_cents:
         raise ListingValidationError("Price exceeds your seller tier limit.")
     if not all((seller.seller_address_name, seller.seller_address_line1, seller.seller_address_city, seller.seller_address_state, seller.seller_address_postal_code)):
@@ -1220,6 +1220,9 @@ class Database:
             "pii_redacted_at": order.pii_redacted_at,
             "created_at": order.created_at, "updated_at": order.updated_at,
         }
+        if order.paid_at:
+            from shipping_performance import deadline
+            result["shipping_due_at"] = deadline(order.paid_at)
         if listing is not None:
             result.update(
                 listing_title=listing.title,
@@ -1278,7 +1281,7 @@ class Database:
             if not address or not address["configured"]:
                 raise ListingValidationError("The seller must add a return shipping address before this card can be purchased.")
             item_cents = int(listing.price_cents or 0)
-            commission_cents = (item_cents * commission_percent + 99) // 100
+            commission_cents = (item_cents * 8 + 99) // 100 + 30
             order = Order(
                 id=order_id, listing_id=listing_id, buyer_id=buyer_id, seller_id=listing.seller_id,
                 item_cents=item_cents, shipping_cents=shipping_cents, commission_cents=commission_cents,
@@ -1469,6 +1472,8 @@ class Database:
             )).scalar_one_or_none()
             if reused:
                 raise ListingValidationError("This tracking number is already attached to another order.")
+            from shipping_performance import award
+            award(session, order)
             first_shipment = order.status == "paid"
             order.tracking_number = tracking_number
             order.tracking_carrier = carrier
