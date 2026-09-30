@@ -1,3 +1,7 @@
+# Account Health release
+
+Read UPDATE-Account-Health.md for deployment and metric definitions.
+
 # PokeMarket Backend 2.18.1 — multi-market navigation and price tiers
 
 Read `UPDATE-2.18.1.md` for this release's deployment notes. The older update

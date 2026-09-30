@@ -100,7 +100,7 @@ def enforce(db, user_id, request):
         return
     path = request.url.path
     # Restricted accounts keep access to existing orders and deletion, never new commerce.
-    allowed = path in {"/api/v1/auth/me", "/api/v1/account/status", "/api/v1/account/delete"}
+    allowed = path in {"/api/v1/auth/me", "/api/v1/account/status", "/api/v1/account/health", "/api/v1/account/delete"}
     allowed |= path == "/api/v1/account/seller-address"
     allowed |= path == "/api/v1/payments/connect/onboard"
     allowed |= request.method == "GET" and (path == "/api/v1/orders" or path.startswith("/api/v1/orders/"))

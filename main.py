@@ -79,6 +79,7 @@ from tcgdex import TCGdexClient
 from recovery import install_recovery, limit_auth, send_action_email
 from tracking import TrackingValidationError, classify_tracking_number
 from community import install_community, cleanup_message_uploads
+from account_health import install_health, record_dispute
 from alerts import install_alerts
 from account_controls import install_account_controls, enforce, process_deletions, ledger_rows, sync_ledger
 
@@ -89,7 +90,7 @@ tcgdex = TCGdexClient(settings.tcgdex_base_url)
 logger = logging.getLogger("pokemarket")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title=settings.app_name, version="2.24.0-cart-watchlist")
+app = FastAPI(title=settings.app_name, version="2.25.0-account-health")
 scan_semaphore = asyncio.Semaphore(1)
 auth_scheme = HTTPBearer(auto_error=False)
 
@@ -254,7 +255,7 @@ async def health():
         status="ok",
         service=settings.app_name,
         environment=settings.environment,
-        version="2.24.0-cart-watchlist",
+        version="2.25.0-account-health",
         ai_provider=settings.ai_provider,
         database=database_status,
         auth="configured" if settings.auth_configured else "not_configured",
@@ -441,7 +442,7 @@ async def admin_sale_detail(order_id: str, _admin=Depends(require_admin), databa
 async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(require_database)):
     result = await asyncio.to_thread(database.admin_diagnostics)
     result.update({
-        "service_version": "2.24.0-cart-watchlist",
+        "service_version": "2.25.0-account-health",
         "email_configured": settings.email_configured,
         "push_configured": settings.firebase_configured,
         "payments_configured": settings.stripe_configured,
@@ -456,6 +457,7 @@ async def admin_diagnostics(_admin=Depends(require_admin), database=Depends(requ
 install_recovery(app, settings, require_database, require_user)
 install_community(app, settings, require_database, require_user, lambda: get_r2_storage())
 install_alerts(app, require_database, require_user)
+install_health(app, require_database, require_user, require_admin)
 install_cart(app, settings, require_database, require_user, lambda: require_stripe())
 install_account_controls(app, settings, require_database, require_user, require_admin)
 
@@ -1740,6 +1742,14 @@ async def stripe_webhook(
     except Exception as exc:
         raise HTTPException(400, "Invalid Stripe webhook signature.") from exc
     event_type = event.get("type")
+    if event_type in {"charge.dispute.created", "charge.dispute.updated", "charge.dispute.closed"}:
+        dispute = event["data"]["object"]
+        intent = dispute.get("payment_intent")
+        if not intent:
+            charge = await asyncio.to_thread(stripe_client.Charge.retrieve, dispute["charge"])
+            intent = charge.get("payment_intent")
+        await asyncio.to_thread(record_dispute, database, dispute, int(event.get("created", 0)), intent)
+        return {"received": True}
     if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
         checkout = event["data"]["object"]
         # Delayed payment methods also emit checkout.session.completed before
