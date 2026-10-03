@@ -23,7 +23,7 @@ def setup(market,monkeypatch,value=10000):
 def test_private_estimate_policies_fee_zero_funded_order(market,monkeypatch):
     c,db,checkout=setup(market,monkeypatch)
     response=c.post('/api/v1/listings/card/instant-offer');assert response.status_code==200,response.text
-    offer=response.json();assert offer['offer_cents']==2900 and offer['fee_cents']==0
+    offer=response.json();assert offer['offer_cents']==2000 and offer['fee_cents']==0
     assert all(k not in offer for k in ['estimate_cents','rationale','confidence','snapshot'])
     assert c.post('/api/v1/listings/card/instant-offer').json()['id']==offer['id']
     rid=offer['id']
@@ -31,11 +31,11 @@ def test_private_estimate_policies_fee_zero_funded_order(market,monkeypatch):
     assert c.post('/api/v1/instant-offers/'+rid+'/decision',json={'accepted':True,'policies_accepted':True}).status_code==200
     lead=c.get('/api/v1/admin/instant-offers/'+rid).json();assert lead['estimate_cents']==10000
     approval=c.post('/api/v1/admin/instant-offers/'+rid+'/approve');assert approval.status_code==200,approval.text
-    assert len(checkout.calls)==1 and checkout.calls[0]['line_items'][0]['price_data']['unit_amount']==2900
+    assert len(checkout.calls)==1 and checkout.calls[0]['line_items'][0]['price_data']['unit_amount']==2000
     assert c.post('/api/v1/admin/instant-offers/'+rid+'/approve').status_code==200 and len(checkout.calls)==1
     oid=approval.json()['order_id']
     with db.sessions() as s:
-        o=s.get(Order,oid);assert o.status=='pending_payment' and o.commission_cents==0 and o.seller_amount_cents==3399
+        o=s.get(Order,oid);assert o.status=='pending_payment' and o.commission_cents==0 and o.seller_amount_cents==2499
         assert s.get(Listing,'card').price_cents==1250
     paid=db.claim_order_payment('cs_instant','pi_instant');assert paid['won']
     confirmed=db.confirm_delivery(oid,'other',10)
@@ -54,9 +54,9 @@ def test_stale_listing_never_fills_instant_order(market,monkeypatch):
 
 def test_offer_rules_boundaries_and_damage_override():
     def data(condition,**extra):return dict(condition=condition,**extra)
-    assert offer_rule(data('Mint'),10000)[0]==29
-    assert offer_rule(data('Near Mint'),10000)[0]==29
-    assert offer_rule(data('Lightly Played'),10000)[0]==24
+    assert offer_rule(data('Mint'),10000)[0]==20
+    assert offer_rule(data('Near Mint'),10000)[0]==20
+    assert offer_rule(data('Lightly Played'),10000)[0]==15
     assert 'not eligible' in offer_rule(data('Moderately Played'),50000)[1]
     assert offer_rule(data('Moderately Played'),50001)[1]=='Condition requires review'
     assert offer_rule(data('Mint',grading_status='graded'),10000)[0] is None
@@ -81,7 +81,7 @@ def test_graded_review_counter_requires_seller_consent(market,monkeypatch):
 
 def test_decline_expiry_permissions(market,monkeypatch):
     c,db,_=setup(market,monkeypatch,9999)
-    o=c.post('/api/v1/listings/card/instant-offer').json();assert o['offer_cents']==2899
+    o=c.post('/api/v1/listings/card/instant-offer').json();assert o['offer_cents']==1999
     assert c.post('/api/v1/instant-offers/'+o['id']+'/decision',json={'accepted':False}).json()['status']=='seller_declined'
     assert c.post('/api/v1/admin/instant-offers/'+o['id']+'/approve').status_code==409
     app.dependency_overrides.pop(require_admin)
@@ -119,7 +119,48 @@ def test_lp_offer_and_wrong_owner_and_sold_card(market,monkeypatch):
     from main import require_user
     c,db,_=setup(market,monkeypatch)
     with db.sessions.begin() as s:s.get(Listing,'card').estimated_condition='Lightly Played'
-    r=c.post('/api/v1/listings/card/instant-offer').json();assert r['offer_cents']==2400
+    r=c.post('/api/v1/listings/card/instant-offer').json();assert r['offer_cents']==1500
     app.dependency_overrides[require_user]=lambda:db.get_user('other')
     assert c.post('/api/v1/listings/card/instant-offer').status_code==404
     assert c.post('/api/v1/instant-offers/'+r['id']+'/decision',json={'accepted':True,'policies_accepted':True}).status_code==404
+
+
+def test_legacy_scan_id_resolves_only_owned_listing(market,monkeypatch):
+    from main import require_user
+    c,db,_=setup(market,monkeypatch)
+    with db.sessions.begin() as s:s.get(Listing,'card').scan_id='old-scan-id'
+    r=c.post('/api/v1/listings/old-scan-id/instant-offer')
+    assert r.status_code==200 and r.json()['listing_id']=='card'
+    app.dependency_overrides[require_user]=lambda:db.get_user('other')
+    assert c.post('/api/v1/listings/old-scan-id/instant-offer').status_code==404
+
+
+def test_new_rates_replace_unanswered_old_quotes(market,monkeypatch):
+    c,db,_=setup(market,monkeypatch)
+    old=c.post('/api/v1/listings/card/instant-offer').json()
+    with db.sessions.begin() as s:
+        row=s.get(InstantOffer,old['id']);row.rate_percent=29;row.offer_cents=2900
+    new=c.post('/api/v1/listings/card/instant-offer').json()
+    assert new['id']!=old['id'] and new['offer_cents']==2000
+    assert c.post('/api/v1/instant-offers/'+old['id']+'/decision',json={'accepted':True,'policies_accepted':True}).status_code==409
+    c.post('/api/v1/instant-offers/'+new['id']+'/decision',json={'accepted':True,'policies_accepted':True})
+    with db.sessions.begin() as s:
+        row=s.get(InstantOffer,new['id']);row.rate_percent=29;row.offer_cents=2900
+    honored=c.post('/api/v1/listings/card/instant-offer').json()
+    assert honored['id']==new['id'] and honored['offer_cents']==2900
+
+
+def test_account_check_survives_stripe_lookup_failure(market,monkeypatch):
+    c,db,_=setup(market,monkeypatch)
+    import main
+    monkeypatch.setattr(main.settings,'stripe_secret_key','sk_test_unavailable')
+    from main import require_user
+    app.dependency_overrides[require_user]=lambda:db.get_user('seller')
+    called=[]
+    def fail(*args,**kwargs):
+        called.append(True)
+        raise RuntimeError('Stripe unavailable')
+    monkeypatch.setattr(main.stripe.Account,'retrieve',fail)
+    r=c.get('/api/v1/auth/me')
+    assert r.status_code==200
+    assert called

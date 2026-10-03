@@ -1,3 +1,7 @@
+# Condition labels and instant-offer fix
+
+Read UPDATE-Condition-Labels.md for this release.
+
 # Sell Instantly release
 
 Read UPDATE-Sell-Instantly.md for final pricing rules and deployment.
